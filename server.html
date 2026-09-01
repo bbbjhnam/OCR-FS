@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>로컬 OCR 재무제표 변환</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="app">
+    <section class="workspace">
+      <header class="topbar">
+        <div>
+          <h1>로컬 OCR 재무제표 변환</h1>
+          <p>기본 빠른 모드는 OCR을 한 번만 실행하며, 텍스트가 이미 있는 PDF는 OCR 없이 바로 추출합니다.</p>
+        </div>
+        <button id="processBtn" class="primary" disabled>OCR·엑셀 생성</button>
+      </header>
+
+      <div id="dropzone" class="dropzone" tabindex="0">
+        <input id="pdfInput" type="file" accept="application/pdf,.xlsx,.xlsm" multiple />
+        <div class="dropIcon" aria-hidden="true">FILE</div>
+        <div>
+          <strong>PDF나 엑셀을 여기에 놓거나 클릭해서 선택하세요</strong>
+          <span>여러 파일을 선택하면 각 파일이 결과 엑셀의 별도 시트로 저장됩니다.</span>
+        </div>
+      </div>
+
+      <section class="modePanel" aria-label="OCR 처리 모드">
+        <label class="modeOption selected">
+          <input type="radio" name="mode" value="fast" checked />
+          <span><strong>빠른 모드</strong><small>권장 · kor+eng, 300 DPI, PSM 6으로 1회 처리</small></span>
+        </label>
+        <label class="modeOption">
+          <input type="radio" name="mode" value="precise" />
+          <span><strong>정밀 모드</strong><small>문제가 있는 파일만 · 5가지 설정을 비교해 최적 결과 선택</small></span>
+        </label>
+      </section>
+
+      <section class="panel">
+        <div class="panelHeader">
+          <div>
+            <h2>처리 결과</h2>
+            <p id="statusText">아직 PDF가 선택되지 않았습니다.</p>
+          </div>
+          <a id="excelLink" class="primary linkButton" hidden>엑셀 다운로드</a>
+        </div>
+        <div id="outputInfo" class="notice" hidden></div>
+        <div id="progressBox" class="progressBox" hidden>
+          <div class="progressTrack"><div id="progressBar" class="progressBar"></div></div>
+          <p id="progressText">준비 중...</p>
+        </div>
+        <div id="resultList" class="resultList"></div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const dropzone = document.querySelector("#dropzone");
+    const input = document.querySelector("#pdfInput");
+    const button = document.querySelector("#processBtn");
+    const statusText = document.querySelector("#statusText");
+    const excelLink = document.querySelector("#excelLink");
+    const outputInfo = document.querySelector("#outputInfo");
+    const resultList = document.querySelector("#resultList");
+    const progressBox = document.querySelector("#progressBox");
+    const progressBar = document.querySelector("#progressBar");
+    const progressText = document.querySelector("#progressText");
+    let files = [];
+    let progressTimer = null;
+    let activeJobId = "";
+    let progressFinalized = false;
+
+    loadServerStatus();
+
+    for (const eventName of ["dragenter", "dragover", "dragleave", "drop"]) {
+      window.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
+    }
+
+    dropzone.addEventListener("click", () => input.click());
+    input.addEventListener("change", () => setFiles(Array.from(input.files || [])));
+    dropzone.addEventListener("drop", (event) => setFiles(Array.from(event.dataTransfer.files || [])));
+    document.querySelectorAll('input[name="mode"]').forEach((input) => input.addEventListener("change", () => {
+      document.querySelectorAll(".modeOption").forEach((option) => option.classList.toggle("selected", option.contains(input) && input.checked));
+    }));
+
+    function setFiles(nextFiles) {
+      files = nextFiles.filter((file) => /\.(pdf|xlsx|xlsm)$/i.test(file.name));
+      button.disabled = files.length === 0;
+      excelLink.hidden = true;
+      resultList.innerHTML = "";
+      statusText.textContent = files.length ? `${files.length}개 파일이 선택되었습니다.` : "PDF 또는 엑셀 파일을 선택해주세요.";
+      loadServerStatus();
+    }
+
+    button.addEventListener("click", async () => {
+      const form = new FormData();
+      for (const file of files) form.append("files", file);
+      const mode = document.querySelector('input[name="mode"]:checked').value;
+      const jobId = crypto.randomUUID().replaceAll("-", "");
+      activeJobId = jobId;
+      progressFinalized = false;
+      form.append("mode", mode);
+      form.append("jobId", jobId);
+      button.disabled = true;
+      statusText.textContent = mode === "fast" ? "빠른 모드로 처리 중입니다." : "정밀 모드로 비교 처리 중입니다.";
+      resultList.innerHTML = "";
+      progressBox.hidden = false;
+      updateProgress(0, files.length, "업로드 중");
+      progressTimer = setInterval(() => pollProgress(jobId), 700);
+
+      try {
+        const response = await fetch("/api/process", { method: "POST", body: form });
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || "처리에 실패했습니다.");
+        renderResult(data, jobId);
+      } catch (error) {
+        statusText.textContent = error.message;
+      } finally {
+        clearInterval(progressTimer);
+        button.disabled = files.length === 0;
+      }
+    });
+
+    function renderResult(data, jobId) {
+      if (jobId !== activeJobId) return;
+      progressFinalized = true;
+      const completed = Number.isFinite(data.completedFiles) ? data.completedFiles : files.length;
+      const total = Number.isFinite(data.totalFiles) ? data.totalFiles : files.length;
+      updateProgress(completed, total, "완료");
+      statusText.textContent = data.ocrAvailable
+        ? `${data.mode === "precise" ? "정밀" : "빠른"} 모드 처리가 완료되었습니다. (${data.parallelFiles}개 병렬)`
+        : "OCRmyPDF가 없어 텍스트형 PDF와 엑셀만 추출했습니다. 아래 안내를 확인하세요.";
+      excelLink.href = data.excelUrl;
+      excelLink.download = "재무제표_추출.xlsx";
+      excelLink.hidden = false;
+      outputInfo.hidden = false;
+      outputInfo.innerHTML = `
+        저장 폴더: <a href="${data.outputDirUrl}">${escapeHtml(data.outputDirPath || data.outputDirUrl)}</a>
+      `;
+
+      if (data.installHint) {
+        const note = document.createElement("div");
+        note.className = "notice";
+        note.textContent = data.installHint;
+        resultList.appendChild(note);
+      }
+
+      for (const doc of data.documents) {
+        const section = document.createElement("section");
+        section.className = "resultCard";
+        const sourceLinks = (doc.sourceFiles || []).map((source, index) => `
+          <div>
+            <strong>${escapeHtml(source.fileName)}</strong>
+            ${source.ocrUrl ? `<a class="ghost linkButton" href="${escapeHtml(source.ocrUrl)}" download>PDF ${index + 1} 다운로드</a>` : ""}
+            ${source.textUrl ? `<a class="ghost linkButton" href="${escapeHtml(source.textUrl)}" download>텍스트 ${index + 1} 다운로드</a>` : ""}
+          </div>
+        `).join("");
+        const rows = doc.rows.map((row) => `
+          <tr>
+            <td>${escapeHtml(row.item)}</td>
+            <td>${formatNumber(row.current)}</td>
+            <td>${row.includePrevious ? formatNumber(row.previous) : "—"}</td>
+            <td>${escapeHtml(row.status)}</td>
+            <td>${escapeHtml(row.sourceLine || "")}</td>
+          </tr>
+        `).join("");
+        section.innerHTML = `
+          <div class="resultHeader">
+            <h3>${escapeHtml(doc.fileName)}</h3>
+            <span>${escapeHtml(doc.ocrStatus)}</span>
+          </div>
+          ${sourceLinks}
+          ${doc.ocrUrl ? `<a class="ghost linkButton" href="${doc.ocrUrl}" download>OCR PDF 다운로드</a>` : ""}
+          ${doc.textUrl ? `<a class="ghost linkButton" href="${doc.textUrl}" download>텍스트 다운로드</a>` : ""}
+          ${doc.ocrError ? `<p class="errorText">${escapeHtml(doc.ocrError)}</p>` : ""}
+          <div class="tableWrap">
+            <table>
+              <thead><tr><th>항목</th><th>당기 금액</th><th>전기 금액 (손익항목만)</th><th>확인 상태</th><th>OCR 원문 줄</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        `;
+        resultList.appendChild(section);
+      }
+    }
+
+    async function pollProgress(jobId) {
+      try {
+        const response = await fetch(`/api/progress?jobId=${encodeURIComponent(jobId)}`, { cache: "no-store" });
+        if (!response.ok) return;
+        const data = await response.json();
+        if (jobId !== activeJobId || progressFinalized) return;
+        updateProgress(data.completed || 0, data.total || files.length, data.current || "처리 중");
+      } catch (_error) {}
+    }
+
+    function updateProgress(completed, total, current) {
+      const percent = total ? Math.round((completed / total) * 100) : 0;
+      progressBar.style.width = `${percent}%`;
+      progressText.textContent = `${completed}/${total} 완료 · ${current}`;
+    }
+
+    async function loadServerStatus() {
+      try {
+        const response = await fetch("/api/status");
+        const data = await response.json();
+        if (!data.ok) return;
+        outputInfo.hidden = false;
+        outputInfo.innerHTML = `
+          현재 서버: ${escapeHtml(data.serverUrl)}<br>
+          저장 폴더: ${escapeHtml(data.outputs)}<br>
+          OCR 상태: ${data.ocrAvailable ? "OCRmyPDF 사용 가능" : "OCRmyPDF 미연결"}
+        `;
+      } catch (_error) {
+        outputInfo.hidden = false;
+        outputInfo.textContent = "서버 상태를 확인하지 못했습니다. start_ocr_server.bat으로 다시 실행해주세요.";
+      }
+    }
+
+    function formatNumber(value) {
+      if (value === "" || value === null || value === undefined) return "";
+      return Number(value).toLocaleString("ko-KR");
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+  </script>
+</body>
+</html>

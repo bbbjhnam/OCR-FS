@@ -1,0 +1,46 @@
+# Runtime output, OCR intermediate files, and local test material
+outputs/
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.temp
+
+# Financial documents and review workbooks must never be uploaded
+*.pdf
+*.PDF
+*.xlsx
+*.XLSX
+*.xls
+*.XLS
+*.xlsm
+*.XLSM
+*.csv
+
+# Local configuration, credentials, and machine-specific paths
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+ocrmypdf_path.txt
+
+# Local backups and editor/system metadata
+*.backup*
+*.bak
+*.orig
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.agents/
+.codex/
+
+# Portable distribution/build output
+portable_builder/
+build/
+dist/
+release/
+*.zip

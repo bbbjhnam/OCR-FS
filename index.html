@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>재무제표 PDF 엑셀 변환</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="app">
+    <section class="workspace">
+      <header class="topbar">
+        <div>
+          <h1>재무제표 PDF 엑셀 변환</h1>
+          <p>PDF에서 자산총계, 부채총계, 자본금, 매출액, 영업이익, 당기순이익을 찾아 당기·전기 금액으로 정리합니다.</p>
+        </div>
+        <div class="actions">
+          <button id="ocrBtn" class="ghost" disabled>OCR PDF 저장</button>
+          <button id="downloadBtn" class="primary" disabled>엑셀 저장</button>
+        </div>
+      </header>
+
+      <div id="dropzone" class="dropzone" tabindex="0">
+        <input id="pdfInput" type="file" accept="application/pdf" multiple />
+        <div class="dropIcon" aria-hidden="true">PDF</div>
+        <div>
+          <strong>PDF를 여기에 놓거나 클릭해서 선택하세요</strong>
+          <span>여러 PDF를 한 번에 선택하면 파일별로 별도 엑셀 시트를 만듭니다.</span>
+        </div>
+      </div>
+
+      <section class="panel">
+        <div class="panelHeader">
+          <div>
+            <h2>추출 결과</h2>
+            <p id="statusText">아직 PDF가 선택되지 않았습니다.</p>
+          </div>
+          <button id="clearBtn" class="ghost">초기화</button>
+        </div>
+
+        <div id="fileTabs" class="fileTabs" aria-label="선택한 PDF 목록"></div>
+
+        <div class="tableWrap">
+          <table>
+            <thead>
+              <tr>
+                <th>항목</th>
+                <th>당기 금액</th>
+                <th>전기 금액</th>
+                <th>확인 상태</th>
+              </tr>
+            </thead>
+            <tbody id="resultBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel split">
+        <div>
+          <h2>원문 확인</h2>
+          <p>자동 인식된 텍스트입니다. 값이 비어 있으면 PDF가 이미지 스캔본일 수 있습니다.</p>
+        </div>
+        <textarea id="rawText" spellcheck="false" placeholder="PDF를 선택하면 추출된 텍스트가 여기에 표시됩니다."></textarea>
+      </section>
+    </section>
+  </main>
+
+  <script src="./vendor/tesseract.min.js"></script>
+  <script src="./vendor/pdf-lib.min.js"></script>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
