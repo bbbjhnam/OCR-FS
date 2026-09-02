@@ -1005,10 +1005,13 @@ def has_single_period_income_layout(lines: list[str]) -> bool:
     for index, line in enumerate(lines):
         if "손익계산서" not in normalize(line):
             continue
-        header = normalize(" ".join(lines[index : index + 18]))
-        if "전기" in header or "(전)기" in header or "2025" in header:
+        raw_header = " ".join(lines[index : index + 18])
+        header = normalize(raw_header)
+        years = set(re.findall(r"(?:19|20)\d{2}", raw_header))
+        periods = set(re.findall(r"제\s*(\d+)\s*기", raw_header))
+        if "전기" in header or "(전)기" in header or len(years) >= 2 or len(periods) >= 2:
             return False
-        if "당기" in header or "(당)기" in header:
+        if "당기" in header or "(당)기" in header or len(years) == 1 or len(periods) == 1:
             found_current_only = True
     if found_current_only:
         return True
@@ -1016,9 +1019,21 @@ def has_single_period_income_layout(lines: list[str]) -> bool:
     return (
         ("손익계산서" in compact_all or "익계산서" in compact_all)
         and "전기" not in compact_all
-        and "2025" not in compact_all
         and ("당기" in compact_all or "2026" in compact_all)
     )
+
+
+def is_first_fiscal_period_income_layout(lines: list[str]) -> bool:
+    """Return True for a one-column income statement explicitly labeled 제1기."""
+    for index, line in enumerate(lines):
+        if "손익계산서" not in normalize(line):
+            continue
+        raw_header = " ".join(lines[index : index + 18])
+        header = normalize(raw_header)
+        periods = set(re.findall(r"제\s*(\d+)\s*기", raw_header))
+        if periods == {"1"} and "전기" not in header and "(전)기" not in header:
+            return True
+    return False
 
 
 def find_cumulative_alias_segment(lines: list[str], aliases: tuple[str, ...]) -> str:
@@ -1224,12 +1239,13 @@ def extract_assets_total(lines: list[str], label: str) -> dict | None:
 
 
 def extract_liabilities_total(lines: list[str], label: str) -> dict | None:
-    direct_segment = find_alias_segment(lines, ("부채총계",), require_two=False)
+    direct_segment = find_quality_alias_segment(lines, ("부채총계",), require_two=False)
     if not direct_segment:
         direct_segment = find_section_heading_total(lines, "부채")
     candidates = []
     for index, line in enumerate(lines):
         compact = normalize(line)
+        compact_label = re.sub(r"[^가-힣A-Za-z0-9]", "", line)
         if (
             ("부채와자본총계" in compact or "부채및자본총계" in compact)
             and "부채총계" not in compact
@@ -1237,9 +1253,9 @@ def extract_liabilities_total(lines: list[str], label: str) -> dict | None:
         ):
             continue
         liability_total_label = (
-            "부채총계" in compact
-            or "채총계" in compact
-            or compact.startswith("채계")
+            "부채총계" in compact_label
+            or "채총계" in compact_label
+            or compact_label.startswith("채계")
             or bool(re.search(r"부채총(?:A[lI1]|[Il1])", compact, re.I))
         )
         if liability_total_label:
@@ -1255,9 +1271,9 @@ def extract_liabilities_total(lines: list[str], label: str) -> dict | None:
                 )
             if len(extract_amounts(candidate)) >= 1:
                 candidates.append(candidate)
-    if direct_segment:
-        candidates = [direct_segment]
-    elif not candidates:
+    if direct_segment and direct_segment not in candidates:
+        candidates.append(direct_segment)
+    if not candidates:
         for index, line in enumerate(lines):
             compact = normalize(line)
             if "부채총계" not in compact and "채총계" not in compact:
@@ -1294,11 +1310,27 @@ def extract_liabilities_total(lines: list[str], label: str) -> dict | None:
                     "sourceLine": f"{combined_match} / {capital_match}",
                 }
         return None
-    match = candidates[0] if direct_segment else min(
-        candidates,
-        key=lambda line: ("자산총계" in normalize(line), len(line)),
-    )
-    amounts = financial_amounts(match, ("부채총계", "부채 총계", "채총계", "채 계", "부채"))
+    def liability_amounts(candidate: str) -> list[int | float]:
+        compact_label = re.sub(r"[^가-힣A-Za-z0-9]", "", candidate)
+        aliases = (
+            ("부채총계", "부채 총계", "채총계", "채 계")
+            if "부채총계" in compact_label or "채총계" in compact_label
+            else ("부채",)
+        )
+        return financial_amounts(candidate, aliases)
+
+    def liability_candidate_rank(candidate: str) -> tuple[int, int, int, int]:
+        amounts = liability_amounts(candidate)
+        raw_amounts = AMOUNT_PATTERN.findall(candidate)
+        comma_grouped = sum(
+            bool(re.fullmatch(r"\(?-?\d{1,3}(?:,\d{3})+\)?", raw.strip()))
+            for raw in raw_amounts[:2]
+        )
+        nonzero = sum(value != 0 for value in amounts[:2])
+        return min(len(amounts), 2), nonzero, comma_grouped, lines.index(candidate) if candidate in lines else -1
+
+    match = max(candidates, key=liability_candidate_rank)
+    amounts = liability_amounts(match)
     current, previous = pick_current_previous(amounts)
     current = abs(current) if current is not None else None
     previous = abs(previous) if previous is not None else None
@@ -1525,7 +1557,9 @@ def calculated_net_income(lines: list[str]) -> tuple[str, int | float | None, in
         ("영업외비용", "영레외비용", "영외비용"),
         absolute=True,
     )
-    tax_line, tax_current, tax_previous = period_values(("법인세등", "법인세비용"), absolute=True)
+    # Preserve a negative tax amount.  It represents a tax benefit and must be
+    # added back when reconciling pretax income to net income.
+    tax_line, tax_current, tax_previous = period_values(("법인세등", "법인세비용"))
     if income_current is None or expense_current is None:
         return None
     tax_current = tax_current or 0
@@ -1598,12 +1632,14 @@ def zero_tax_pretax_income(lines: list[str]) -> tuple[str, int | float | None, i
         numbers = [-abs(value) for value in numbers]
     current, previous = pick_income_current_previous(numbers, lines)
     if has_single_period_income_layout(lines):
-        previous = 0
+        previous = None if is_first_fiscal_period_income_layout(lines) else 0
     return match, current, previous
 
 
 def extract_net_income(lines: list[str], label: str) -> dict | None:
     all_lines = lines
+    single_period = has_single_period_income_layout(all_lines)
+    first_fiscal_period = is_first_fiscal_period_income_layout(all_lines)
     lines = income_statement_scope(lines)
     period_summary = find_period_net_summary(all_lines)
     aliases = ("당기순손실", "당기순이익", "당기손익", "분기순손실", "분기순이익", "반기순손익")
@@ -1690,8 +1726,8 @@ def extract_net_income(lines: list[str], label: str) -> dict | None:
     elif "순손익" in compact_match and len(numbers) >= 2 and numbers[0] < 0 < numbers[1]:
         numbers = apply_loss_row_signs(match, numbers)
     current, previous = pick_income_current_previous(numbers, lines)
-    if has_single_period_income_layout(lines):
-        previous = 0
+    if single_period:
+        previous = None if first_fiscal_period else 0
     if pretax:
         pretax_source, pretax_current, pretax_previous = pretax
         suspicious_current = current in (None, 0) or (
@@ -1740,6 +1776,8 @@ def extract_net_income(lines: list[str], label: str) -> dict | None:
                 and abs(previous - calculated_previous) <= tolerance(calculated_previous)
             ):
                 previous = calculated_previous
+    if single_period:
+        previous = None if first_fiscal_period else 0
     return {
         "item": label,
         "current": current if current is not None else "",
@@ -1783,6 +1821,7 @@ def operating_profit_from_components(lines: list[str]) -> tuple[str, int | float
 
 
 def extract_operating_profit(lines: list[str], label: str) -> dict | None:
+    single_period = has_single_period_income_layout(lines)
     aliases = ("영업손실", "영업이익", "영업손익")
     exact_match = find_cumulative_alias_segment(lines, aliases)
     if not exact_match:
@@ -1819,6 +1858,8 @@ def extract_operating_profit(lines: list[str], label: str) -> dict | None:
     elif "영업손익" in compact and len(numbers) >= 2 and numbers[0] < 0 < numbers[1]:
         numbers = apply_loss_row_signs(match, numbers)
     current, previous = pick_income_current_previous(numbers, lines)
+    if single_period:
+        previous = None
     calculated = operating_profit_from_components(lines)
     if calculated:
         _source_line, calculated_current, calculated_previous = calculated
@@ -1835,6 +1876,8 @@ def extract_operating_profit(lines: list[str], label: str) -> dict | None:
             and abs(previous - calculated_previous) <= tolerance(calculated_previous)
         ):
             previous = calculated_previous
+    if single_period:
+        previous = None
     return {
         "item": label,
         "current": current if current is not None else "",
@@ -1983,6 +2026,7 @@ def find_quality_alias_segment(
 
 def extract_revenue(lines: list[str], label: str) -> dict | None:
     all_lines = lines
+    single_period = has_single_period_income_layout(all_lines)
     income_start = next(
         (
             index for index, line in enumerate(lines)
@@ -1992,15 +2036,10 @@ def extract_revenue(lines: list[str], label: str) -> dict | None:
     )
     lines = lines[income_start:]
     aliases = ("매출액", "배출액", "영업수익")
-    single_direct_match = find_alias_segment(lines, aliases, prefer_last=False, require_two=False)
+    single_direct_match = find_quality_alias_segment(lines, aliases, require_two=False)
     direct_match = find_cumulative_alias_segment(lines, aliases)
     if not direct_match:
-        direct_match = find_alias_segment(
-            lines,
-            aliases,
-            prefer_last=False,
-            require_two=True,
-        )
+        direct_match = find_quality_alias_segment(lines, aliases, require_two=True)
     if not direct_match:
         direct_match = find_context_candidate(lines, ("매출액", "배출액", "영업수익"), exclude=("원가",))
     if not direct_match:
@@ -2116,6 +2155,8 @@ def extract_revenue(lines: list[str], label: str) -> dict | None:
 
     numbers = financial_amounts(match, ("매출액", "배출액", "출액", "영업수익", "수수료", "제품매출", "매출"))
     current, previous = pick_income_current_previous(numbers, lines)
+    if single_period:
+        previous = None
     raw_match_amounts = extract_amounts(match)
     if (
         len(raw_match_amounts) >= 3
@@ -2209,6 +2250,8 @@ def extract_revenue(lines: list[str], label: str) -> dict | None:
                 and (previous is None or abs(previous) < max(1, abs(current)) * 0.01)
             ):
                 previous = component_previous
+    if single_period:
+        previous = None
     return {
         "item": label,
         "current": current if current is not None else "",
