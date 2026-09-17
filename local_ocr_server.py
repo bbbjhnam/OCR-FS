@@ -139,7 +139,9 @@ def process_upload(request: Handler) -> dict:
         mode = "fast"
     job_id = form.getfirst("jobId", "") or uuid.uuid4().hex
 
-    session_dir = OUTPUTS / time.strftime("%Y%m%d_%H%M%S")
+    # A timestamp alone can collide when two browser requests start during the
+    # same second. Keep the readable timestamp and add a short random suffix.
+    session_dir = OUTPUTS / f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     upload_dir = session_dir / "uploads"
     final_dir = session_dir / "final"
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -154,7 +156,9 @@ def process_upload(request: Handler) -> dict:
             continue
 
         original_name = safe_filename(field.filename)
-        input_path = upload_dir / original_name
+        # Prefix the stored name so two equally named files from different
+        # folders cannot overwrite one another in the same upload.
+        input_path = upload_dir / f"{index:03d}_{original_name}"
         with input_path.open("wb") as file:
             shutil.copyfileobj(field.file, file)
         upload_items.append((index, original_name, input_path))
@@ -170,8 +174,16 @@ def process_upload(request: Handler) -> dict:
             }
             for completed, future in enumerate(as_completed(futures), start=1):
                 item = futures[future]
-                documents.append(future.result())
-                update_job(job_id, completed=completed, current=item[1])
+                try:
+                    document = future.result()
+                    current = item[1]
+                except Exception as exc:
+                    # One damaged PDF must not discard every successfully
+                    # processed company in a multi-file batch.
+                    document = failed_document(item, exc)
+                    current = f"{item[1]} (실패)"
+                documents.append(document)
+                update_job(job_id, completed=completed, current=current)
     finally:
         shutil.rmtree(upload_dir, ignore_errors=True)
 
@@ -208,10 +220,11 @@ def update_job(job_id: str, **values) -> None:
 
 def process_one_file(item, final_dir: Path, ocrmypdf_command: list[str], mode: str) -> dict:
     index, original_name, input_path = item
-    base_name = input_path.stem
+    base_name = Path(original_name).stem
+    storage_base_name = f"{index:03d}_{base_name}"
     suffix = input_path.suffix.lower()
-    final_pdf_path = final_dir / f"{base_name}_최종.pdf"
-    final_text_path = final_dir / f"{base_name}_텍스트.txt"
+    final_pdf_path = final_dir / f"{storage_base_name}_최종.pdf"
+    final_text_path = final_dir / f"{storage_base_name}_텍스트.txt"
     ocr_status = "OCRmyPDF 미설치"
     ocr_error = ""
     text = ""
@@ -223,43 +236,23 @@ def process_one_file(item, final_dir: Path, ocrmypdf_command: list[str], mode: s
         embedded_text = extract_text(input_path)
         if has_meaningful_text(embedded_text):
             text = embedded_text
-            if ocrmypdf_command and needs_precise_retry(embedded_text):
-                result = run_fast_ocr(ocrmypdf_command, input_path, final_pdf_path, final_text_path)
-                if result["ok"] and extraction_quality(result["text"]) > extraction_quality(embedded_text):
-                    text = result["text"]
-                    ocr_status = f"텍스트 구조 불량 · 자동 OCR 보정: {result['profile']}"
-                    if needs_precise_retry(text):
-                        precise = run_best_ocr(
-                            ocrmypdf_command,
-                            input_path,
-                            final_dir,
-                            base_name,
-                            final_pdf_path,
-                            final_text_path,
-                        )
-                        if precise["ok"] and extraction_quality(precise["text"]) > extraction_quality(text):
-                            text = precise["text"]
-                            ocr_status = f"텍스트 구조 불량 · 자동 정밀 보정: {precise['profile']}"
-                else:
-                    shutil.copyfile(input_path, final_pdf_path)
-                    ocr_status = "텍스트 PDF 감지 · OCR 보정 이득 없음"
-            else:
-                shutil.copyfile(input_path, final_pdf_path)
-                ocr_status = "텍스트 PDF 감지 · OCR 생략"
+            shutil.copyfile(input_path, final_pdf_path)
+            ocr_status = "텍스트 PDF 감지 · OCR 생략"
         elif ocrmypdf_command:
             if mode == "precise":
-                result = run_best_ocr(ocrmypdf_command, input_path, final_dir, base_name, final_pdf_path, final_text_path)
+                result = run_best_ocr(
+                    ocrmypdf_command,
+                    input_path,
+                    final_dir,
+                    storage_base_name,
+                    final_pdf_path,
+                    final_text_path,
+                )
             else:
                 result = run_fast_ocr(ocrmypdf_command, input_path, final_pdf_path, final_text_path)
             if result["ok"]:
                 text = result["text"]
                 ocr_status = f"{('정밀' if mode == 'precise' else '빠른')} OCR 완료: {result['profile']}"
-                if mode == "fast" and needs_precise_retry(text):
-                    precise = run_best_ocr(ocrmypdf_command, input_path, final_dir, base_name, final_pdf_path, final_text_path)
-                    if precise["ok"] and extraction_quality(precise["text"]) > extraction_quality(text):
-                        result = precise
-                        text = precise["text"]
-                        ocr_status = f"빠른 OCR 품질 부족 · 자동 정밀 보정: {precise['profile']}"
             else:
                 text = embedded_text
                 ocr_status = "OCR 실패"
@@ -284,6 +277,23 @@ def process_one_file(item, final_dir: Path, ocrmypdf_command: list[str], mode: s
         "textUrl": to_url(final_text_path) if final_text_path.exists() else "",
         "sourceText": text[:6000],
         "rows": report_rows(extracted_rows),
+    }
+
+
+def failed_document(item, error: Exception) -> dict:
+    """Represent an isolated file failure without aborting the whole batch."""
+    index, original_name, _input_path = item
+    base_name = Path(original_name).stem
+    return {
+        "index": index,
+        "fileName": original_name,
+        "sheetName": unique_sheet_name(base_name, index),
+        "ocrStatus": "처리 실패",
+        "ocrError": str(error),
+        "ocrUrl": "",
+        "textUrl": "",
+        "sourceText": "",
+        "rows": report_rows([]),
     }
 
 
@@ -466,6 +476,7 @@ def extraction_quality(text: str) -> int:
 
 
 def needs_precise_retry(text: str) -> bool:
+    """Report extraction risk for diagnostics; mode selection stays user-controlled."""
     rows = {row["item"]: row for row in extract_financial_rows(text)}
     required = ("자산총계", "부채총계", "자본금", "매출액", "영업이익", "당기순이익")
     missing = sum(rows.get(item, {}).get("current") in ("", None) for item in required)
@@ -1577,21 +1588,60 @@ def calculated_net_income(lines: list[str]) -> tuple[str, int | float | None, in
     return source, current, previous
 
 
+INCOME_STATEMENT_HEADINGS = ("포괄손익계산서", "손익계산서", "익계산서")
+INCOME_STATEMENT_ENDINGS = ("결손금처리계산서", "이익잉여금처분계산서")
+INCOME_STATEMENT_BODY_TERMS = (
+    "매출액",
+    "영업수익",
+    "매출원가",
+    "매출총이익",
+    "판매비와관리비",
+    "영업이익",
+    "영업손실",
+    "당기순이익",
+    "당기순손실",
+    "법인세차감전",
+)
+
+
+def income_statement_start(lines: list[str]) -> int:
+    """Choose the actual statement body instead of a table-of-contents entry."""
+    candidates = [
+        index
+        for index, line in enumerate(lines)
+        if any(term in normalize(line) for term in INCOME_STATEMENT_HEADINGS)
+    ]
+    if not candidates:
+        return -1
+
+    def has_financial_body(start: int) -> bool:
+        seen_terms: set[str] = set()
+        for index in range(start + 1, min(len(lines), start + 180)):
+            compact = normalize(lines[index])
+            if any(term in compact for term in INCOME_STATEMENT_ENDINGS) or any(
+                term in compact for term in INCOME_STATEMENT_HEADINGS
+            ):
+                break
+            matched = [term for term in INCOME_STATEMENT_BODY_TERMS if term in compact]
+            if matched and extract_amounts(lines[index]):
+                seen_terms.update(matched)
+                if len(seen_terms) >= 2:
+                    return True
+        return False
+
+    # Preserve the original first-statement behaviour and skip only headings
+    # that have no financial rows before the next heading (typically a TOC).
+    return next((index for index in candidates if has_financial_body(index)), candidates[0])
+
+
 def income_statement_scope(lines: list[str]) -> list[str]:
-    start = next(
-        (
-            index
-            for index, line in enumerate(lines)
-            if any(term in normalize(line) for term in ("포괄손익계산서", "손익계산서", "익계산서"))
-        ),
-        -1,
-    )
+    start = income_statement_start(lines)
     if start < 0:
         return lines
     end = len(lines)
     for index in range(start + 1, len(lines)):
         compact = normalize(lines[index])
-        if any(term in compact for term in ("결손금처리계산서", "이익잉여금처분계산서")):
+        if any(term in compact for term in INCOME_STATEMENT_ENDINGS):
             end = index
             break
     return lines[start:end]
