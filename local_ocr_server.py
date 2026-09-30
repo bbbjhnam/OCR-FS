@@ -47,7 +47,7 @@ AMOUNT_PATTERN = re.compile(
     r"\d{1,3}(?:,\s?\d{3})+(?:\.\d+)?|"
     r"\d{1,3}(?:\.\s?\d{3})+|"
     r"\d{4,}(?:\.\d+)?|"
-    r"0(?:\.\d+)?"
+    r"(?<!\d)0(?:\.\d+)?(?!\d)"
     r")\)?"
 )
 OCR_PROFILES = [
@@ -134,9 +134,9 @@ def process_upload(request: Handler) -> dict:
     if not isinstance(fields, list):
         fields = [fields]
 
-    mode = form.getfirst("mode", "fast")
+    mode = form.getfirst("mode", "precise")
     if mode not in ("fast", "precise"):
-        mode = "fast"
+        mode = "precise"
     job_id = form.getfirst("jobId", "") or uuid.uuid4().hex
 
     # A timestamp alone can collide when two browser requests start during the
@@ -746,7 +746,9 @@ def extract_financial_rows(text: str) -> list[dict]:
             assets_row = extract_assets_total(lines, label)
             if assets_row:
                 rows.append(assets_row)
-                continue
+            else:
+                rows.append({"item": label, "current": "", "previous": "", "status": "미발견"})
+            continue
         if label == "부채총계":
             liabilities_row = extract_liabilities_total(lines, label)
             if liabilities_row:
@@ -772,7 +774,9 @@ def extract_financial_rows(text: str) -> list[dict]:
             capital_row = extract_capital(lines, label)
             if capital_row:
                 rows.append(capital_row)
-                continue
+            else:
+                rows.append({"item": label, "current": "", "previous": "", "status": "미발견"})
+            continue
         if label == "영업이익":
             operating_row = extract_operating_profit(lines, label)
             if operating_row:
@@ -784,7 +788,9 @@ def extract_financial_rows(text: str) -> list[dict]:
             net_income_row = extract_net_income(lines, label)
             if net_income_row:
                 rows.append(net_income_row)
-                continue
+            else:
+                rows.append({"item": label, "current": "", "previous": "", "status": "미발견"})
+            continue
         if label == "매출액":
             revenue_row = extract_revenue(base_lines, label)
             if revenue_row:
@@ -801,7 +807,7 @@ def extract_financial_rows(text: str) -> list[dict]:
         is_loss = "손실" in compact_match or label in ("영업이익", "당기순이익") and "손" in compact_match
         numbers = extract_amounts(match)
         if is_loss:
-            numbers = [-num for num in numbers]
+            numbers = [-abs(num) for num in numbers]
 
         current, previous = pick_current_previous(numbers)
         rows.append(
@@ -836,9 +842,20 @@ def normalize_ocr_numbers(text: str) -> str:
         r"\1,\2",
         normalized,
     )
+    def merge_split_six_digit_groups(match: re.Match) -> str:
+        # If a complete current-period amount already appears on this row, two
+        # six-digit groups after it are usually one damaged previous-period
+        # amount (``77,701,095 7,426 698,918``).  Without that anchor they are
+        # two legitimate period columns (``674,377 236,625``).
+        line_start = match.string.rfind("\n", 0, match.start()) + 1
+        prefix = match.string[line_start : match.start()]
+        if AMOUNT_PATTERN.search(prefix):
+            return f"{match.group(1)},{match.group(2)}"
+        return match.group(0)
+
     normalized = re.sub(
         r"(?<![\d,])(\d{1,3},\d{3})[ \t]+(\d{3},\d{3})(?![\d,])",
-        r"\1,\2",
+        merge_split_six_digit_groups,
         normalized,
     )
     normalized = re.sub(
@@ -848,12 +865,22 @@ def normalize_ocr_numbers(text: str) -> str:
     )
     normalized = re.sub(r"\([ \t]+(?=-?\d)", "(", normalized)
     normalized = re.sub(r"(?<=\d)[ \t]+\)", ")", normalized)
-    for _ in range(3):
-        normalized = re.sub(
-            r"(\d{1,3}(?:,\d{3})+)[ \t]+(\d{3})(?![\d,])",
-            r"\1,\2",
-            normalized,
-        )
+    def merge_trailing_thousands(match: re.Match) -> str:
+        # A detached final thousands group is repaired only when another full
+        # amount already precedes it on the same row.  This covers OCR such as
+        # ``4,758,539,687 3,814,846 887`` while preserving a legitimate small
+        # comparison value such as ``48,232 660``.
+        line_start = match.string.rfind("\n", 0, match.start()) + 1
+        prefix = match.string[line_start : match.start()]
+        if AMOUNT_PATTERN.search(prefix):
+            return f"{match.group(1)},{match.group(2)}"
+        return match.group(0)
+
+    normalized = re.sub(
+        r"(\d{1,3}(?:,\d{3})+)[ \t]+(\d{3})(?![\d,])",
+        merge_trailing_thousands,
+        normalized,
+    )
     return normalized
 
 
@@ -880,6 +907,8 @@ def repair_accounting_spacing(text: str) -> str:
         "당기순손실",
         "법인세차감전손익",
         "법인세차감전손실",
+        "법인세비용차감전손익",
+        "법인세비용차감전손실",
         "수수료",
         "제품매출",
         "영업수익",
@@ -891,16 +920,32 @@ def repair_accounting_spacing(text: str) -> str:
         (r"영\s*업\s*손\s*[실쉼]", "영업손실"),
         (r"영\s*업\s*[드도]\s*실", "영업손실"),
         (r"염\s*업\s*손\s*실", "영업손실"),
-        (r"당\s*[기키]\s*순\s*[손=]\s*[실a]", "당기순손실"),
+        (r"당\s*[기키]\s*순\s*[손=]\s*[실a4]", "당기순손실"),
         (r"당\s*[기키]\s*[순=]\s*이\s*익", "당기순이익"),
         (r"(?:부\s*)?채\s*[총촉]\s*[계A]", "부채총계"),
-        (r"자\s*산\s*총\s*[계A]", "자산총계"),
+        (r"부\s*채\s*&\s*A[HIl1]", "부채총계"),
+        (r"자\s*산\s*[총춤]\s*[계A]", "자산총계"),
+        (r"자\s*A\s*F\s*[총춤]\s*[계A]", "자산총계"),
+        (r"유\s*[동통]\s*[.ㆍ]?\s*자\s*산", "유동자산"),
+        (r"비\s*유\s*[동톨]\s*[.ㆍ]?\s*자\s*산", "비유동자산"),
+        (r"유\s*[동통]\s*[.ㆍ]?\s*부\s*[채A]", "유동부채"),
+        (r"채\s*유\s*부\s*[채A]", "유동부채"),
+        (r"비\s*유\s*[동톨]\s*[.ㆍ]?\s*부\s*[채A]", "비유동부채"),
         (r"자\s*(?:본|=)\s*[금3aACl]+", "자본금"),
+        # Some dense trial-balance exports OCR ``자본금`` as ``차 본 2``.
+        # Repairing that aggregate label lets us keep the total row instead of
+        # mistaking the following common/preferred-stock components for periods.
+        (r"차\s*본\s*2", "자본금"),
         (r"(?:At|Xt)\s*본\s*금", "자본금"),
+        (r"보\s*[통롱동]\s*주\s*[AX자차]?\s*본\s*[금급]", "보통주 자본금"),
+        (r"[우쿠]\s*선\s*주\s*[AX자차]?\s*본\s*[금급]", "우선주 자본금"),
         (r"(?:매|[oO0]f)\s*[출줄술]\s*(?:액|[oO0]f)", "매출액"),
+        (r"메\s*출\s*[액역]", "매출액"),
         (r"(?:판|©)\s*(?:매|[oO0]f)\s*비\s*와\s*관\s*리\s*비", "판매비와관리비"),
         (r"판\s*매\s*비\s*와\s*관\s*리[^\d\n]{0,5}", "판매비와관리비 "),
+        (r"법\s*인\s*셰", "법인세"),
         (r"법\s*인\s*세\s*[등릉]", "법인세등"),
+        (r"[당망]\s*[기키]\s*순\s*손\s*익", "당기손익"),
         (r"(?:매|[oO0]f)\s*[출줄]\s*총\s*이\s*[익9¢]", "매출총이익"),
     )
     for pattern, replacement in fuzzy_terms:
@@ -933,12 +978,48 @@ def add_continuation_candidates(lines: list[str]) -> list[str]:
         )
         if not has_target_hint:
             continue
+        if len(line) > 500 or is_dense_account_label_blob(line):
+            # A page-wide OCR label blob followed by vertical numeric columns
+            # has no reliable row alignment.  Joining its first numbers would
+            # fabricate totals from unrelated accounts.
+            continue
+        # A complete two-period row must not absorb the following account.
+        # Doing so contaminated totals with values from 자본잉여금 and other
+        # adjacent rows.
+        if len(extract_amounts(line)) >= 2:
+            continue
         lookahead = 2
         if index + lookahead < len(lines):
             combined = " ".join(lines[index : index + lookahead + 1])
             if extract_amounts(combined):
                 expanded.append(combined)
     return expanded
+
+
+def is_dense_account_label_blob(line: str) -> bool:
+    """Identify page-wide OCR label bands that have lost their row alignment.
+
+    Spreadsheet-like PDFs sometimes expose every account label as one text line
+    and every numeric column as later lines.  Even when the label band is under
+    the old 500-character guard, joining its following numbers invents totals.
+    These blocks are deliberately left for manual review because there is no
+    trustworthy positional relationship left in the extracted text.
+    """
+    compact = normalize(line)
+    labels = (
+        "유동자산",
+        "비유동자산",
+        "자산총계",
+        "유동부채",
+        "비유동부채",
+        "부채총계",
+        "자본금",
+        "자본총계",
+        "부채와자본총계",
+        "부채및자본총계",
+    )
+    label_count = sum(label in compact for label in labels)
+    return len(compact) >= 120 and label_count >= 4
 
 
 def prefer_separate_statement_scope(lines: list[str]) -> list[str]:
@@ -949,19 +1030,28 @@ def prefer_separate_statement_scope(lines: list[str]) -> list[str]:
     When a separate statement appears first, keep that complete set and stop at
     the first consolidated statement heading.
     """
-    has_separate = any("별도" in normalize(line) for line in lines[:1200])
-    if not has_separate:
+    def is_statement_heading(compact: str) -> bool:
+        return any(term in compact for term in ("재무상태표", "손익계산서", "포괄손익계산서"))
+
+    separate_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if "별도" in (compact := normalize(line)) and is_statement_heading(compact)
+    ]
+    consolidated_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if "연결" in (compact := normalize(line)) and is_statement_heading(compact)
+    ]
+    # A note saying "별도로" is not a separate financial statement.  The old
+    # broad check truncated some consolidated reports before their first real
+    # statement.
+    if not separate_indexes or not consolidated_indexes:
         return lines
-    for index, line in enumerate(lines):
-        compact = normalize(line)
-        if index > 20 and (
-            "연결재무상태표" in compact
-            or "가결산연결재무상태표" in compact
-            or "연결손익계산서" in compact
-            or "가결산연결손익계산서" in compact
-        ):
-            return lines[:index]
-    return lines
+    # Preserve the established preference for the separate-company set.  The
+    # important correction above is that ordinary prose containing "별도로"
+    # no longer activates this truncation.
+    return lines[: min(consolidated_indexes)]
 
 
 def is_amount_only_line(line: str) -> bool:
@@ -984,16 +1074,43 @@ def find_vertical_alias_segment(
         compact = normalize(line)
         if not any(alias in compact for alias in aliases):
             continue
+        if len(line) > 500 or is_dense_account_label_blob(line):
+            continue
+        if extract_amounts(line):
+            continue
         collected: list[int | float] = []
+        pending_prefix: int | None = None
         for following in lines[index + 1 : index + 13]:
             if is_amount_only_line(following):
-                for value in extract_amounts(following):
+                following_values = extract_amounts(following)
+                # Some spreadsheet-to-PDF exports duplicate the same visual
+                # cell four times on one OCR line.  Count that line as one
+                # period so the next line can supply the comparison period.
+                if len(following_values) >= 2 and len(set(following_values)) == 1:
+                    following_values = following_values[:1]
+                else:
+                    following_values = collapse_ocr_repetitions(following_values)
+                if (
+                    pending_prefix is not None
+                    and following_values
+                    and 1_000 <= abs(following_values[0]) < 1_000_000
+                    and following.count(",") == 1
+                ):
+                    combined = pending_prefix * 1_000_000 + abs(following_values[0])
+                    following_values[0] = -combined if following_values[0] < 0 else combined
+                pending_prefix = None
+                for value in following_values:
                     if positive_only and value <= 0:
                         continue
                     collected.append(value)
                     if len(collected) == amount_count:
                         return " ".join([line, *(format_parser_amount(item) for item in collected)])
                 continue
+            short_prefix = re.fullmatch(r"\s*(\d{1,3})\s*", following)
+            if short_prefix and int(short_prefix.group(1)) > 0:
+                pending_prefix = int(short_prefix.group(1))
+                continue
+            pending_prefix = None
             if collected and re.search(r"[가-힣A-Za-z]", following):
                 break
     return ""
@@ -1002,9 +1119,18 @@ def find_vertical_alias_segment(
 def has_cumulative_income_layout(lines: list[str]) -> bool:
     for index, line in enumerate(lines):
         compact = normalize(" ".join(lines[index : index + 24]))
+        cumulative_markers = (
+            compact.count("누적")
+            + compact.count("누계")
+            + compact.count("두적")
+            + compact.count("분기말")
+            + compact.count("반기말")
+            + compact.count("9개월")
+            + compact.count("6개월")
+        )
         if (
             compact.count("3개월") >= 2
-            and (compact.count("누적") + compact.count("누계") + compact.count("두적")) >= 2
+            and cumulative_markers >= 2
         ):
             return True
     return False
@@ -1012,6 +1138,9 @@ def has_cumulative_income_layout(lines: list[str]) -> bool:
 
 def has_single_period_income_layout(lines: list[str]) -> bool:
     """Return True when the income statement exposes only a current-period column."""
+    compact_all = normalize(" ".join(lines))
+    if "표준재무제표" in compact_all and "전기" not in compact_all:
+        return True
     found_current_only = False
     for index, line in enumerate(lines):
         if "손익계산서" not in normalize(line):
@@ -1026,11 +1155,33 @@ def has_single_period_income_layout(lines: list[str]) -> bool:
             found_current_only = True
     if found_current_only:
         return True
-    compact_all = normalize(" ".join(lines))
     return (
         ("손익계산서" in compact_all or "익계산서" in compact_all)
         and "전기" not in compact_all
         and ("당기" in compact_all or "2026" in compact_all)
+    )
+
+
+def has_trailing_income_statement_title(lines: list[str]) -> bool:
+    """Detect spreadsheet exports whose statement title is printed last.
+
+    Such files contain one current-period column only.  Returning zero for the
+    missing comparison period fabricates a prior-year value, so it must remain
+    blank.
+    """
+    headings = [
+        index
+        for index, line in enumerate(lines)
+        if any(term in normalize(line) for term in INCOME_STATEMENT_HEADINGS)
+    ]
+    if not headings or headings[-1] < max(0, len(lines) - 5):
+        return False
+    trailing = headings[-1]
+    body_terms = ("매출액", "영업이익", "영업손실", "당기순이익", "당기순손실", "법인세차감전")
+    return any(
+        extract_amounts(lines[index])
+        and any(term in normalize(lines[index]) for term in body_terms)
+        for index in range(max(0, trailing - 180), trailing)
     )
 
 
@@ -1112,7 +1263,7 @@ def english_financial_candidates(lines: list[str]) -> list[str]:
 
     capital = find_row((r"\bcontributed\s+capital\b", r"\bshare\s+capital\b", r"\bcapital\s+stock\b"))
     if capital:
-        candidates.append(translated("자본금", capital))
+        candidates.append(translated("영문 자본금", capital))
 
     revenue = find_row((r"\brevenue\s*\(sales\)", r"^\s*(?:[ivx]+[.)]?\s*)?revenue\b", r"^\s*sales\b"))
     if revenue:
@@ -1134,23 +1285,124 @@ def format_parser_amount(value: int | float) -> str:
     return f"{int(value):,}"
 
 
+def find_nearby_reversed_total(lines: list[str], aliases: tuple[str, ...]) -> str:
+    """Recover exports that place a value row immediately before its label."""
+    for index, line in enumerate(lines):
+        compact = normalize(line)
+        matched_alias = next((alias for alias in aliases if compact == alias), "")
+        if not matched_alias or extract_amounts(line):
+            continue
+        for previous_index in range(index - 1, max(-1, index - 5), -1):
+            candidate = lines[previous_index]
+            amounts = extract_amounts(candidate)
+            if (
+                len(amounts) == 2
+                and all(value > 0 for value in amounts)
+                and re.fullmatch(r"[\s\d,.]+", candidate)
+            ):
+                return (
+                    f"{matched_alias} {format_parser_amount(amounts[0])} "
+                    f"{format_parser_amount(amounts[1])}"
+                )
+    return ""
+
+
 def find_combined_balance_total(lines: list[str]) -> str:
     aliases = ("부채와자본총계", "부채및자본총계")
     exact_candidates: list[str] = []
     fallback_candidates: list[str] = []
     for line in lines:
-        if not any(alias in normalize(line) for alias in aliases):
+        matched_alias = next((alias for alias in aliases if alias in normalize(line)), "")
+        if not matched_alias or len(line) > 800 or is_dense_account_label_blob(line):
             continue
-        numbers = financial_amounts(line, aliases)
+        alias_position = normalize(line).find(matched_alias)
+        values_after_alias = financial_amounts(line, aliases)
+        if (
+            "자본총계" in normalize(line)[:alias_position]
+            and len(values_after_alias) >= 4
+        ):
+            return (
+                f"{matched_alias} {format_parser_amount(values_after_alias[1])} "
+                f"{format_parser_amount(values_after_alias[3])}"
+            )
+        segment = slice_alias_amounts(line, matched_alias)
+        if not segment:
+            continue
+        numbers = financial_amounts(segment, aliases)
         if numbers and numbers[0] > 0:
-            fallback_candidates.append(line)
+            fallback_candidates.append(segment)
             if len(numbers) == 2:
-                exact_candidates.append(line)
+                exact_candidates.append(segment)
     if exact_candidates:
         return min(exact_candidates, key=len)
     if fallback_candidates:
         return fallback_candidates[0]
+    reversed_total = find_nearby_reversed_total(lines, aliases)
+    if reversed_total:
+        return reversed_total
     return find_vertical_alias_segment(lines, aliases, amount_count=2, positive_only=True)
+
+
+def find_interleaved_equity_balance_totals(
+    lines: list[str],
+) -> tuple[str, list[int | float], list[int | float]] | None:
+    """Parse ``자본총계/부채및자본총계`` printed as alternating columns."""
+    combined_aliases = ("부채와자본총계", "부채및자본총계")
+    for line in lines:
+        compact = normalize(line)
+        if (
+            len(line) > 800
+            or is_dense_account_label_blob(line)
+            or "자본총계" not in compact
+            or not any(alias in compact for alias in combined_aliases)
+        ):
+            continue
+        first_label = compact.find("자본총계")
+        # Use the original line from the equity label onward.  The visual
+        # column order is equity-current, balance-current, equity-previous,
+        # balance-previous.
+        normalized_line = normalize_ocr_numbers(line)
+        label_match = re.search(r"자\s*본\s*총\s*계", normalized_line)
+        tail = normalized_line[label_match.start() :] if label_match else normalized_line
+        amounts = financial_amounts(tail, ("자본총계",))
+        if len(amounts) >= 4 and all(value > 0 for value in amounts[:4]):
+            return line, [amounts[0], amounts[2]], [amounts[1], amounts[3]]
+    return None
+
+
+def find_vertical_share_capital_from_balance(
+    lines: list[str],
+) -> tuple[str, list[int | float]] | None:
+    """Recover vertical share-capital rows using the balance equation anchors."""
+    interleaved = find_interleaved_equity_balance_totals(lines)
+    if not interleaved:
+        return None
+    _source, equity_values, balance_values = interleaved
+    liabilities = [balance - equity for balance, equity in zip(balance_values, equity_values)]
+    recovered: list[int | float] = []
+    sources: list[str] = []
+    for liability in liabilities:
+        capital_value = None
+        for index, line in enumerate(lines[:-1]):
+            amounts = extract_amounts(line)
+            if len(amounts) != 1 or amounts[0] != liability:
+                continue
+            for following in lines[index + 1 : index + 3]:
+                following_amounts = extract_amounts(following)
+                if (
+                    len(following_amounts) == 1
+                    and 10_000 <= following_amounts[0] < liability
+                    and re.fullmatch(r"[\s\d,.]+", following)
+                ):
+                    capital_value = following_amounts[0]
+                    sources.extend((line, following))
+                    break
+            if capital_value is not None:
+                break
+        if capital_value is None:
+            return None
+        recovered.append(capital_value)
+    return " / ".join(sources), recovered
 
 
 def find_section_heading_total(lines: list[str], section: str) -> str:
@@ -1165,12 +1417,194 @@ def find_section_heading_total(lines: list[str], section: str) -> str:
     return ""
 
 
+def find_columnar_period_total(lines: list[str], alias: str) -> str:
+    """Recover a total from OCR that emitted each comparison column vertically.
+
+    This intentionally requires an explicit ``(비교)`` period header and takes
+    the final standalone amount in each column.  Without both anchors, returning
+    blank is safer than borrowing an unrelated account value.
+    """
+    for label_index, line in enumerate(lines):
+        if normalize(line) != alias or extract_amounts(line):
+            continue
+        comparison_index = next(
+            (
+                index
+                for index in range(label_index + 1, min(len(lines), label_index + 80))
+                if "비교" in normalize(lines[index])
+                and re.search(r"제\s*\d+\s*기", lines[index])
+            ),
+            -1,
+        )
+        if comparison_index < 0:
+            continue
+
+        def standalone_candidates(start: int, end: int) -> list[int | float]:
+            values: list[int | float] = []
+            for candidate in lines[start:end]:
+                amounts = extract_amounts(candidate)
+                if len(amounts) != 1 or re.search(r"(?:19|20)\d{2}[./-]", candidate):
+                    continue
+                if not re.fullmatch(r"[\s()\-\d,.]+", candidate):
+                    continue
+                if abs(amounts[0]) >= 1_000_000:
+                    values.append(amounts[0])
+            return values
+
+        current_values = standalone_candidates(label_index + 1, comparison_index)
+        previous_end = min(len(lines), comparison_index + 45)
+        for index in range(comparison_index + 1, previous_end):
+            compact = normalize(lines[index])
+            if index > comparison_index + 1 and (
+                lines[index].startswith("---")
+                or re.search(r"(?:19|20)\d{2}/\d{2}/\d{2}.*\d{1,2}:\d{2}", lines[index])
+            ):
+                previous_end = index
+                break
+        previous_values = standalone_candidates(comparison_index + 1, previous_end)
+        if current_values and previous_values:
+            return (
+                f"{alias} {format_parser_amount(current_values[-1])} "
+                f"{format_parser_amount(previous_values[-1])}"
+            )
+    return ""
+
+
+def find_balance_component_total(
+    lines: list[str], section: str
+) -> tuple[str, int | float | None, int | float | None] | None:
+    """Sum current/non-current subtotals inside the primary balance sheet.
+
+    This is a guarded cross-check for a damaged total row, not a general
+    replacement for an explicit total.
+    """
+    if section == "자산":
+        current_alias, noncurrent_alias = "유동자산", "비유동자산"
+    else:
+        current_alias, noncurrent_alias = "유동부채", "비유동부채"
+
+    income_start = income_statement_start(lines)
+    balance_lines = lines[:income_start] if income_start > 0 else lines[:400]
+
+    def best_component(alias: str, *, exclude: str = "") -> tuple[str, list[int | float]] | None:
+        candidates: list[tuple[str, list[int | float]]] = []
+        for line in balance_lines:
+            compact = normalize(line)
+            if alias not in compact:
+                continue
+            # ``유동부채`` is a substring of ``비유동부채``.  Reject only a
+            # substring-only hit; a flattened OCR line may legitimately hold
+            # both current and non-current rows and must be sliced by label.
+            if exclude and alias not in compact.replace(exclude, ""):
+                continue
+            if alias == noncurrent_alias and f"기타{noncurrent_alias}" in compact:
+                continue
+            segment = slice_alias_amounts(line, alias)
+            if not segment or len(segment) > 800 or len(extract_amounts(segment)) > 4:
+                continue
+            amounts = financial_amounts(segment, (alias,))
+            raw_amounts = AMOUNT_PATTERN.findall(normalize_ocr_numbers(segment))
+            clean_cells = sum(
+                bool(re.fullmatch(r"\(?-?(?:\d{1,3}(?:,\d{3})+|0)\)?", raw.strip()))
+                for raw in raw_amounts[:2]
+            )
+            if len(amounts) >= 2 and clean_cells >= 2:
+                candidates.append((segment, amounts))
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda item: (
+                min(len(item[1]), 2),
+                sum(value != 0 for value in item[1][:2]),
+                0,
+            ),
+        )
+
+    current_part = best_component(current_alias, exclude=noncurrent_alias)
+    noncurrent_part = best_component(noncurrent_alias)
+    if not current_part or not noncurrent_part:
+        return None
+    current_values = pick_current_previous(current_part[1])
+    noncurrent_values = pick_current_previous(noncurrent_part[1])
+    summed = []
+    for current_value, noncurrent_value in zip(current_values, noncurrent_values):
+        if current_value is None or noncurrent_value is None:
+            summed.append(None)
+        else:
+            summed.append(current_value + noncurrent_value)
+    return f"{current_part[0]} / {noncurrent_part[0]}", summed[0], summed[1]
+
+
+def prefer_component_crosscheck(
+    direct: int | float | None, component: int | float | None
+) -> bool:
+    if component in (None, 0) or direct in (None, 0):
+        return False
+    if direct == component:
+        return False
+    direct_abs = abs(direct)
+    component_abs = abs(component)
+    # Only override a direct total when its magnitude is unmistakably damaged
+    # (typically a dropped group of three OCR digits).  A full-sized direct
+    # total remains authoritative even if a noisy note subtotal is much larger.
+    obvious_magnitude_damage = (
+        direct_abs < 1_000_000
+        and component_abs >= 1_000_000
+        and direct_abs * 100 < component_abs
+        and component_abs <= direct_abs * 1_000_000
+    )
+    return obvious_magnitude_damage
+
+
 def extract_assets_total(lines: list[str], label: str) -> dict | None:
-    # The accounting identity makes this the most reliable asset total when
-    # the dedicated asset row contains a damaged digit.
-    match = find_combined_balance_total(lines)
-    if not match:
-        match = find_alias_segment(lines, ("자산총계",), require_two=False)
+    # A clean two-period ``부채및자본총계`` is an accounting-identity crosscheck
+    # for an OCR-damaged asset row.  It is safe only when it has exactly two
+    # values; a four-value capital/combined row must never donate its first pair.
+    # Take the first explicit row even when it contains only the current period.
+    # Requiring two values first can select a synthetic continuation that joins
+    # the next liability row and mislabels it as the previous-period asset total.
+    direct_match = find_columnar_period_total(lines, "자산총계")
+    if not direct_match:
+        for line in lines:
+            compact = normalize(line)
+            if "자산총계" not in compact or any(
+                subtotal in compact
+                for subtotal in ("유동자산총계", "비유동자산총계", "기타비유동자산총계")
+            ):
+                continue
+            segment = slice_alias_amounts(line, "자산총계")
+            direct_amounts = financial_amounts(segment, ("자산총계",)) if segment else []
+            if not direct_amounts:
+                continue
+            first_periods = direct_amounts[:2]
+            if first_periods and all(1900 <= abs(value) <= 2100 for value in first_periods):
+                continue
+            if (
+                len(first_periods) >= 2
+                and any(1900 <= abs(value) <= 2100 for value in first_periods)
+                and any(abs(value) >= 1_000_000 for value in first_periods)
+            ):
+                continue
+            direct_match = segment
+            break
+    combined_match = find_combined_balance_total(lines)
+    combined_amounts = (
+        financial_amounts(
+            combined_match,
+            ("부채와자본총계", "부채및자본총계", "자본과부채총계"),
+        )
+        if combined_match
+        else []
+    )
+    combined_has_year = (
+        len(combined_amounts) >= 2
+        and any(1900 <= abs(value) <= 2100 for value in combined_amounts[:2])
+        and any(abs(value) >= 1_000_000 for value in combined_amounts[:2])
+    )
+    match = direct_match
+    if not match and combined_match and not combined_has_year:
+        match = combined_match
     if not match:
         match = find_section_heading_total(lines, "자산")
     if not match:
@@ -1182,40 +1616,30 @@ def extract_assets_total(lines: list[str], label: str) -> dict | None:
             for line in lines
             if "산총계" in normalize(line)
             and not any(term in normalize(line) for term in ("부채", "자본"))
+            and not any(
+                subtotal in normalize(line)
+                for subtotal in ("유동자산총계", "비유동자산총계", "기타비유동자산총계")
+            )
             and extract_amounts(line)
+            and any(value != 0 for value in extract_amounts(line))
         ]
         if fuzzy_totals:
             match = max(
                 fuzzy_totals,
-                key=lambda line: max((abs(value) for value in extract_amounts(line)), default=0),
+                key=lambda line: max(
+                    (abs(value) for value in financial_amounts(line, ("산총계",))),
+                    default=0,
+                ),
             )
     if not match:
         match = find_best_line(lines, ["자산총계", "자 산 총 계"], label)
+        if match and any(
+            subtotal in normalize(match)
+            for subtotal in ("유동자산총계", "비유동자산총계", "기타비유동자산총계")
+        ):
+            match = ""
     if match and not extract_amounts(match):
-        match_index = lines.index(match)
-        preceding = [
-            lines[previous_index]
-            for previous_index in range(match_index - 1, max(-1, match_index - 20), -1)
-            if len(extract_amounts(lines[previous_index])) >= 2
-        ]
-        match = max(preceding, key=lambda line: abs(extract_amounts(line)[0]), default="")
-    if not match:
-        for index, line in enumerate(lines):
-            if not any(term in normalize(line) for term in ("부채와자본총계", "부채및자본총계")):
-                continue
-            if extract_amounts(line):
-                match = line
-                break
-            match = next(
-                (
-                    lines[previous_index]
-                    for previous_index in range(index - 1, max(-1, index - 6), -1)
-                    if extract_amounts(lines[previous_index])
-                ),
-                "",
-            )
-            if match:
-                break
+        match = ""
     if not match:
         for index, line in enumerate(lines):
             compact = normalize(line)
@@ -1226,6 +1650,20 @@ def extract_assets_total(lines: list[str], label: str) -> dict | None:
                     match = line
                     break
             if "산" in compact and extract_amounts(line):
+                if any(
+                    subtotal in compact
+                    for subtotal in (
+                        "유동자산",
+                        "비유동자산",
+                        "당좌자산",
+                        "재고자산",
+                        "투자자산",
+                        "유형자산",
+                        "무형자산",
+                        "기타비유동자산",
+                    )
+                ) or not any(value != 0 for value in extract_amounts(line)):
+                    continue
                 following = "".join(normalize(item) for item in lines[index + 1 : index + 5])
                 previous = "".join(normalize(item) for item in lines[max(0, index - 20) : index])
                 if "부채" in following and ("유동" in previous or "비유동" in previous):
@@ -1235,32 +1673,103 @@ def extract_assets_total(lines: list[str], label: str) -> dict | None:
         return None
     numbers = financial_amounts(
         match,
-        ("자산총계", "자산 총계", "부채와자본총계", "부채및자본총계"),
+        ("자산총계", "자산 총계", "산총계", "부채와자본총계", "부채및자본총계"),
     )
     current, previous = pick_current_previous(numbers)
     current = abs(current) if current is not None else None
     previous = abs(previous) if previous is not None else None
+    # A clean balance-equation total is an independent check on the asset row.
+    # When the two differ only slightly, the asset row is commonly missing or
+    # misreading one OCR digit while the combined total remains intact.
+    combined_current, combined_previous = pick_current_previous(combined_amounts)
+    combined_replaced = False
+    if not combined_has_year:
+        if (
+            prefer_component_crosscheck(current, combined_current)
+            or current not in (None, 0)
+            and combined_current not in (None, 0)
+            and abs(abs(current) - abs(combined_current))
+            <= max(1_000, max(abs(current), abs(combined_current)) * 0.02)
+        ):
+            current = abs(combined_current) if combined_current is not None else None
+            combined_replaced = True
+        if (
+            prefer_component_crosscheck(previous, combined_previous)
+            or previous not in (None, 0)
+            and combined_previous not in (None, 0)
+            and abs(abs(previous) - abs(combined_previous))
+            <= max(1_000, max(abs(previous), abs(combined_previous)) * 0.02)
+        ):
+            previous = abs(combined_previous) if combined_previous is not None else None
+            combined_replaced = True
+    component_total = find_balance_component_total(lines, "자산")
+    status = "부채·자본 합계로 교차검증" if combined_replaced else "확인 필요"
+    if combined_replaced:
+        match = f"{match} / 교차검증: {combined_match}"
+    if component_total:
+        component_source, component_current, component_previous = component_total
+        replace_current = prefer_component_crosscheck(current, component_current)
+        replace_previous = prefer_component_crosscheck(previous, component_previous)
+        if replace_current:
+            current = abs(component_current) if component_current is not None else None
+        if replace_previous:
+            previous = abs(component_previous) if component_previous is not None else None
+        if replace_current or replace_previous:
+            match = f"{match} / 교차검증: {component_source}"
+            status = "유동·비유동 합계로 교차검증"
+    if current not in (None, 0) and previous not in (None, 0):
+        larger = max(abs(current), abs(previous))
+        smaller = min(abs(current), abs(previous))
+        if smaller < 10_000_000 and larger > smaller * 500:
+            if abs(current) == smaller:
+                current = None
+            else:
+                previous = None
+            status = "OCR 숫자 자릿수 손상 - 원문 확인 필요"
     return {
         "item": label,
         "current": current if current is not None else "",
         "previous": previous if previous is not None else "",
-        "status": "확인 필요" if current is not None or previous is not None else "금액 없음",
+        "status": status if current is not None or previous is not None else "금액 없음",
         "sourceLine": match,
     }
 
 
 def extract_liabilities_total(lines: list[str], label: str) -> dict | None:
+    malformed_group_pattern = re.compile(
+        r"(?<![\d,])\(?-?\d{1,3}(?:,\s?\d{3})+,\s?\d{1,2}(?!\d)"
+    )
+
+    def malformed_period_indexes(candidate: str) -> set[int]:
+        normalized = normalize_ocr_numbers(candidate)
+        label_positions = [
+            normalized.find(alias)
+            for alias in ("부채총계", "부채 총계", "채총계", "채 계", "부채")
+            if normalized.find(alias) >= 0
+        ]
+        if label_positions:
+            normalized = normalized[min(label_positions):]
+        ordinary = list(AMOUNT_PATTERN.finditer(normalized))
+        damaged: set[int] = set()
+        for malformed in malformed_group_pattern.finditer(normalized):
+            for index, amount in enumerate(ordinary[:2]):
+                if amount.start() == malformed.start():
+                    damaged.add(index)
+                    break
+        return damaged
+
     direct_segment = find_quality_alias_segment(lines, ("부채총계",), require_two=False)
     if not direct_segment:
         direct_segment = find_section_heading_total(lines, "부채")
+    if not direct_segment:
+        direct_segment = find_nearby_reversed_total(lines, ("부채총계",))
     candidates = []
     for index, line in enumerate(lines):
         compact = normalize(line)
         compact_label = re.sub(r"[^가-힣A-Za-z0-9]", "", line)
-        if (
-            ("부채와자본총계" in compact or "부채및자본총계" in compact)
-            and "부채총계" not in compact
-            and "채총계" not in compact
+        if any(
+            combined in compact
+            for combined in ("부채와자본총계", "부채및자본총계", "자본과부채총계")
         ):
             continue
         liability_total_label = (
@@ -1270,37 +1779,44 @@ def extract_liabilities_total(lines: list[str], label: str) -> dict | None:
             or bool(re.search(r"부채총(?:A[lI1]|[Il1])", compact, re.I))
         )
         if liability_total_label:
-            candidate = line
-            if not extract_amounts(candidate):
-                candidate = next(
-                    (
-                        lines[previous_index]
-                        for previous_index in range(index - 1, max(-1, index - 6), -1)
-                        if extract_amounts(lines[previous_index])
-                    ),
-                    " ".join(lines[index : index + 3]),
-                )
-            if len(extract_amounts(candidate)) >= 1:
+            candidate = slice_alias_amounts(line, "부채총계") or line
+            if (
+                len(extract_amounts(candidate)) >= 1
+                and len(candidate) <= 800
+                and len(extract_amounts(candidate)) <= 4
+            ):
                 candidates.append(candidate)
-    if direct_segment and direct_segment not in candidates:
+    if (
+        direct_segment
+        and len(direct_segment) <= 800
+        and len(extract_amounts(direct_segment)) <= 4
+        and direct_segment not in candidates
+    ):
         candidates.append(direct_segment)
     if not candidates:
-        for index, line in enumerate(lines):
-            compact = normalize(line)
-            if "부채총계" not in compact and "채총계" not in compact:
-                continue
-            candidate = next(
-                (
-                    lines[previous_index]
-                    for previous_index in range(index - 1, max(-1, index - 6), -1)
-                    if extract_amounts(lines[previous_index])
-                ),
-                "",
-            )
-            if candidate:
-                candidates.append(candidate)
-                break
-    if not candidates:
+        interleaved = find_interleaved_equity_balance_totals(lines)
+        if interleaved:
+            source_line, equity_values, balance_values = interleaved
+            current = balance_values[0] - equity_values[0]
+            previous = balance_values[1] - equity_values[1]
+            if current >= 0 and previous >= 0:
+                return {
+                    "item": label,
+                    "current": current,
+                    "previous": previous,
+                    "status": "부채·자본 합계 - 자본총계 계산",
+                    "sourceLine": source_line,
+                }
+        component_total = find_balance_component_total(lines, "부채")
+        if component_total:
+            component_source, current, previous = component_total
+            return {
+                "item": label,
+                "current": abs(current) if current is not None else "",
+                "previous": abs(previous) if previous is not None else "",
+                "status": "유동·비유동 부채 합산",
+                "sourceLine": component_source,
+            }
         combined_match = find_combined_balance_total(lines)
         capital_match = find_vertical_alias_segment(lines, ("자본총계",), amount_count=2)
         if combined_match and capital_match:
@@ -1312,6 +1828,13 @@ def extract_liabilities_total(lines: list[str], label: str) -> dict | None:
             )
             current = subtract_values(combined_current, capital_current)
             previous = subtract_values(combined_previous, capital_previous)
+            # A balance total minus equity can never produce a negative
+            # liability.  If OCR alignment makes it negative, omit that period
+            # rather than publishing a mathematically impossible value.
+            if current is not None and current < 0:
+                current = None
+            if previous is not None and previous < 0:
+                previous = None
             if current is not None or previous is not None:
                 return {
                     "item": label,
@@ -1330,26 +1853,65 @@ def extract_liabilities_total(lines: list[str], label: str) -> dict | None:
         )
         return financial_amounts(candidate, aliases)
 
-    def liability_candidate_rank(candidate: str) -> tuple[int, int, int, int]:
+    def liability_candidate_rank(candidate: str) -> tuple[int, int, int, int, int, int]:
         amounts = liability_amounts(candidate)
         raw_amounts = AMOUNT_PATTERN.findall(candidate)
         comma_grouped = sum(
             bool(re.fullmatch(r"\(?-?\d{1,3}(?:,\d{3})+\)?", raw.strip()))
             for raw in raw_amounts[:2]
         )
+        thousands_groups = sum(raw.strip().count(",") for raw in raw_amounts[:2])
         nonzero = sum(value != 0 for value in amounts[:2])
-        return min(len(amounts), 2), nonzero, comma_grouped, lines.index(candidate) if candidate in lines else -1
+        return (
+            int(not malformed_period_indexes(candidate)),
+            min(len(amounts), 2),
+            nonzero,
+            comma_grouped,
+            thousands_groups,
+            lines.index(candidate) if candidate in lines else -1,
+        )
 
     match = max(candidates, key=liability_candidate_rank)
     amounts = liability_amounts(match)
     current, previous = pick_current_previous(amounts)
     current = abs(current) if current is not None else None
     previous = abs(previous) if previous is not None else None
+    malformed_periods = malformed_period_indexes(match)
+    component_total = find_balance_component_total(lines, "부채")
+    status = (
+        "OCR 숫자 자릿수 손상 - 원문 확인 필요"
+        if malformed_periods
+        else "확인 필요"
+    )
+    replaced_malformed: set[int] = set()
+    if component_total:
+        component_source, component_current, component_previous = component_total
+        replace_current = (
+            0 in malformed_periods and component_current not in (None, 0)
+        ) or prefer_component_crosscheck(current, component_current)
+        replace_previous = (
+            1 in malformed_periods and component_previous not in (None, 0)
+        ) or prefer_component_crosscheck(previous, component_previous)
+        if replace_current:
+            current = abs(component_current) if component_current is not None else None
+            if 0 in malformed_periods:
+                replaced_malformed.add(0)
+        if replace_previous:
+            previous = abs(component_previous) if component_previous is not None else None
+            if 1 in malformed_periods:
+                replaced_malformed.add(1)
+        if replace_current or replace_previous:
+            match = f"{match} / 교차검증: {component_source}"
+            status = "유동·비유동 합계로 교차검증"
+    if 0 in malformed_periods and 0 not in replaced_malformed:
+        current = None
+    if 1 in malformed_periods and 1 not in replaced_malformed:
+        previous = None
     return {
         "item": label,
         "current": current if current is not None else "",
         "previous": previous if previous is not None else "",
-        "status": "확인 필요" if current is not None or previous is not None else "금액 없음",
+        "status": status if current is not None or previous is not None else "금액 없음",
         "sourceLine": match,
     }
 
@@ -1381,20 +1943,176 @@ def find_capital_component_total(lines: list[str], capital_lines: list[str]) -> 
     return None
 
 
+def find_share_class_capital_total(
+    lines: list[str],
+) -> tuple[str, list[int | float]] | None:
+    """Sum common and preferred share capital without treating them as periods.
+
+    OCR frequently flattens the aggregate, common-share and preferred-share
+    rows onto one physical line.  In that layout the old parser read the two
+    component values as current/previous periods.  Parse each labelled row
+    independently and add the share classes instead.
+    """
+    explicit_pattern = re.compile(
+        r"(?P<common>보\s*통\s*주\s*자본금)|(?P<preferred>우\s*선\s*주\s*자본금)"
+    )
+    plain_pattern = re.compile(r"자본금")
+    trailing_boundary = re.compile(
+        r"자본잉여금|주식발행초과금|자본조정|기타포괄손익|이익잉여금|"
+        r"결손금|자본총계|부채(?:와|및)?자본총계"
+    )
+
+    candidates: list[tuple[int, str, str, list[int | float], int]] = []
+    for line_index, line in enumerate(lines):
+        explicit = list(explicit_pattern.finditer(line))
+        explicit_spans = [match.span() for match in explicit]
+        labelled: list[tuple[int, int, str]] = []
+        for match in explicit:
+            labelled.append(
+                (match.start(), match.end(), "common" if match.lastgroup == "common" else "preferred")
+            )
+        for match in plain_pattern.finditer(line):
+            if any(start <= match.start() < end for start, end in explicit_spans):
+                continue
+            labelled.append((match.start(), match.end(), "plain"))
+        labelled.sort()
+        for position, (start, end, kind) in enumerate(labelled):
+            stop = labelled[position + 1][0] if position + 1 < len(labelled) else len(line)
+            boundary = trailing_boundary.search(line, end, stop)
+            if boundary:
+                stop = boundary.start()
+            segment = line[start:stop]
+            amounts = financial_amounts(segment, ("자본금",))[:2]
+            if (
+                not amounts
+                or all(1900 <= abs(value) <= 2100 for value in amounts)
+                or any(not isinstance(value, int) or abs(value) < 10_000 for value in amounts)
+            ):
+                continue
+            candidates.append((line_index, kind, segment, amounts, start))
+
+    preferred = [candidate for candidate in candidates if candidate[1] == "preferred"]
+    if not preferred:
+        return None
+
+    def pair_rank(pair: tuple[tuple, tuple]) -> tuple[int, int, int]:
+        common_row, preferred_row = pair
+        return (
+            int(common_row[0] == preferred_row[0]),
+            min(len(common_row[3]), len(preferred_row[3])),
+            -abs(common_row[0] - preferred_row[0]),
+        )
+
+    pairs: list[tuple[tuple, tuple]] = []
+    explicit_common = [candidate for candidate in candidates if candidate[1] == "common"]
+    for preferred_row in preferred:
+        nearby_common = [
+            candidate
+            for candidate in explicit_common
+            if abs(candidate[0] - preferred_row[0]) <= 4
+        ]
+        if not nearby_common:
+            # If OCR lost the word "보통주", the last plain 자본금 immediately
+            # before 우선주자본금 is the common-share component.  Choosing the
+            # last one avoids an earlier aggregate 자본금 row.
+            nearby_common = [
+                candidate
+                for candidate in candidates
+                if candidate[1] == "plain"
+                and (
+                    candidate[0] < preferred_row[0]
+                    and preferred_row[0] - candidate[0] <= 3
+                    or candidate[0] == preferred_row[0] and candidate[4] < preferred_row[4]
+                )
+            ]
+            if nearby_common:
+                nearby_common = [max(nearby_common, key=lambda item: (item[0], item[4]))]
+        pairs.extend((common_row, preferred_row) for common_row in nearby_common)
+    if not pairs:
+        return None
+    common_row, preferred_row = max(pairs, key=pair_rank)
+    current = abs(common_row[3][0]) + abs(preferred_row[3][0])
+    amounts: list[int | float] = [current]
+    if len(common_row[3]) >= 2 and len(preferred_row[3]) >= 2:
+        amounts.append(abs(common_row[3][1]) + abs(preferred_row[3][1]))
+    aggregate_rows = [
+        candidate
+        for candidate in candidates
+        if candidate[1] == "plain"
+        and candidate != common_row
+        and (
+            candidate[0] < common_row[0] and common_row[0] - candidate[0] <= 1
+            or candidate[0] == common_row[0] and candidate[4] < common_row[4]
+        )
+        and (
+            abs(candidate[3][0]) >= abs(common_row[3][0])
+            and abs(candidate[3][0]) >= abs(preferred_row[3][0])
+            or len(candidate[3]) >= 2
+            and len(amounts) >= 2
+            and abs(candidate[3][1]) == abs(amounts[1])
+        )
+    ]
+    if aggregate_rows:
+        aggregate = max(aggregate_rows, key=lambda item: (item[0], item[4]))
+        return aggregate[2], [abs(value) for value in aggregate[3]]
+    if common_row[1] == "plain":
+        nearby_values: list[int | float] = []
+        for line_index in range(max(0, common_row[0] - 1), min(len(lines), common_row[0] + 2)):
+            nearby_values.extend(abs(value) for value in extract_amounts(lines[line_index]))
+        has_aggregate_evidence = all(abs(value) in nearby_values for value in amounts)
+        if not has_aggregate_evidence:
+            # With no explicit 보통주 label or independent summed total, the
+            # plain 자본금 row is itself more likely the aggregate (some forms
+            # list additional preferred-share subclasses on later rows).
+            return common_row[2], [abs(value) for value in common_row[3]]
+    return f"{common_row[2]} / {preferred_row[2]}", amounts
+
+
 def find_capital_section_total(lines: list[str]) -> tuple[str, list[int]] | None:
     """Recover the bold capital total when OCR mangles its Korean row label."""
     for section_index, line in enumerate(lines):
         section_letters = re.sub(r"[^가-힣A-Za-z]", "", line)
-        if section_letters not in ("자본", "쟈본", "At", "Xt"):
+        exact_heading = section_letters in ("자본", "쟈본", "At", "Xt")
+        noisy_latin_heading = (
+            not exact_heading
+            and len(section_letters) <= 6
+            and section_letters.startswith(("At", "Xt"))
+        )
+        if not exact_heading and not noisy_latin_heading:
             continue
         for candidate_index in range(section_index + 1, min(len(lines), section_index + 5)):
             candidate = lines[candidate_index]
             amounts = extract_amounts(candidate)
             if len(amounts) < 2 or amounts[0] <= 0:
                 continue
-            following = normalize(" ".join(lines[candidate_index + 1 : candidate_index + 6]))
+            if all(1900 <= abs(value) <= 2100 for value in amounts[:2]):
+                continue
+            search_end = candidate_index + (16 if noisy_latin_heading else 6)
+            following_lines = lines[candidate_index + 1 : search_end]
+            following = normalize(" ".join(following_lines))
             has_plain_capital = "자본금" in following or "자봄금" in following
             has_preferred_capital = bool(re.search(r"우.{0,3}주.{0,3}(?:자)?본.{0,2}금", following))
+            if noisy_latin_heading:
+                common_lines = [
+                    item for item in following_lines
+                    if "보통주" in normalize(item) and "자본금" in normalize(item)
+                ]
+                preferred_lines = [
+                    item for item in following_lines
+                    if "우선주" in normalize(item) and "자본금" in normalize(item)
+                ]
+                if not common_lines or not preferred_lines:
+                    continue
+                common_values = financial_amounts(common_lines[0], ("자본금",))
+                preferred_values = financial_amounts(preferred_lines[0], ("자본금",))
+                if len(common_values) < 2 or len(preferred_values) < 2:
+                    continue
+                if (
+                    abs(common_values[0]) + abs(preferred_values[0]) == abs(amounts[0])
+                    and abs(common_values[1]) + abs(preferred_values[1]) == abs(amounts[1])
+                ):
+                    return candidate, amounts[:2]
+                continue
             if has_plain_capital and (has_preferred_capital or "자본잉여금" in following):
                 return candidate, amounts[:2]
     return None
@@ -1409,6 +2127,18 @@ def extract_capital(lines: list[str], label: str) -> dict | None:
     if not capital_lines:
         return None
 
+    vertical_total = find_vertical_share_capital_from_balance(lines)
+    if vertical_total:
+        source_line, amounts = vertical_total
+        current, previous = pick_current_previous(amounts)
+        return {
+            "item": label,
+            "current": current if current is not None else "",
+            "previous": previous if previous is not None else "",
+            "status": "수직 열 자본금 교차검증",
+            "sourceLine": source_line,
+        }
+
     section_total = find_capital_section_total(lines)
     if section_total:
         source_line, amounts = section_total
@@ -1418,6 +2148,18 @@ def extract_capital(lines: list[str], label: str) -> dict | None:
             "current": abs(current) if current is not None else "",
             "previous": abs(previous) if previous is not None else "",
             "status": "자본 구성 총액 사용",
+            "sourceLine": source_line,
+        }
+
+    share_class_total = find_share_class_capital_total(lines)
+    if share_class_total:
+        source_line, amounts = share_class_total
+        current, previous = pick_current_previous(amounts)
+        return {
+            "item": label,
+            "current": current if current is not None else "",
+            "previous": previous if previous is not None else "",
+            "status": "보통주·우선주 자본금 합산",
             "sourceLine": source_line,
         }
 
@@ -1433,6 +2175,23 @@ def extract_capital(lines: list[str], label: str) -> dict | None:
             "sourceLine": source_line,
         }
 
+    def capital_segment(line: str) -> str:
+        return slice_alias_amounts(line, "자본금") or line
+
+    def capital_candidate_rank(line: str) -> tuple[int, int, int | float]:
+        amounts = financial_amounts(capital_segment(line), ("자본금",))
+        normalized = normalize_ocr_numbers(line)
+        label_match = re.search(r"자\s*본\s*금", normalized)
+        prefix = normalized[: label_match.start()] if label_match else ""
+        # Roman-numbered ``Ⅰ.자본금`` is often a section aggregate that also
+        # includes 기타자본.  Prefer the following plain ``자본금`` detail row.
+        is_section_heading = bool(re.search(r"[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]", prefix))
+        return (
+            int(not is_section_heading),
+            min(len(amounts), 2),
+            max((abs(amount) for amount in amounts[:2]), default=-1),
+        )
+
     plain = [
         line
         for line in capital_lines
@@ -1443,20 +2202,36 @@ def extract_capital(lines: list[str], label: str) -> dict | None:
         source_lines = [
             max(
                 plain,
-                key=lambda line: max(
-                    (abs(amount) for amount in financial_amounts(line, ("자본금",))),
-                    default=-1,
-                ),
+                key=capital_candidate_rank,
             )
         ]
     elif common:
         source_lines = common[:1]
     else:
         source_lines = capital_lines[:1]
-    amounts = financial_amounts(source_lines[0], ("자본금",))
+    # A continuation candidate may contain ``aggregate / common / preferred``
+    # capital rows on one line.  Limit parsing to the first capital row so the
+    # second component is never mistaken for the comparison period.
+    source_segment = capital_segment(source_lines[0])
+    if len(source_segment) > 800 or len(extract_amounts(source_segment)) > 4:
+        return None
+    amounts = financial_amounts(source_segment, ("자본금",))
     current, previous = pick_current_previous(amounts)
     current = abs(current) if current is not None else None
     previous = abs(previous) if previous is not None else None
+    allow_decimal = any("영문" in normalize(line) for line in source_lines)
+    if current is not None and ((not allow_decimal and not isinstance(current, int)) or abs(current) < 10_000):
+        current = None
+    if previous is not None and ((not allow_decimal and not isinstance(previous, int)) or abs(previous) < 10_000):
+        previous = None
+    if current not in (None, 0) and previous not in (None, 0):
+        larger = max(abs(current), abs(previous))
+        smaller = min(abs(current), abs(previous))
+        if smaller < 10_000_000 and larger > smaller * 500:
+            if abs(current) == smaller:
+                current = None
+            else:
+                previous = None
     return {
         "item": label,
         "current": current if current is not None else "",
@@ -1469,38 +2244,52 @@ def extract_capital(lines: list[str], label: str) -> dict | None:
 def apply_loss_row_signs(line: str, numbers: list[int]) -> list[int]:
     if not numbers:
         return numbers
+    compact = normalize(line)
+    explicit_loss = any(
+        alias in compact
+        for alias in ("영업손실", "당기순손실", "분기순손실", "반기순손실", "순손실")
+    ) and not ("이익" in compact and "손실" in compact)
+    if explicit_loss:
+        # The row label applies to every displayed period.  A leading minus on
+        # one OCR cell is still a loss marker, not evidence that the cell should
+        # be flipped back to profit.
+        normalized_line = normalize_ocr_numbers(line)
+        raw_amounts = AMOUNT_PATTERN.findall(normalized_line)
+        signed = [-abs(number) for number in numbers]
+        for index in range(1, len(signed)):
+            previous_raw = raw_amounts[index - 1] if index - 1 < len(raw_amounts) else ""
+            raw = raw_amounts[index] if index < len(raw_amounts) else ""
+            previous_end = normalized_line.find(previous_raw) + len(previous_raw) if previous_raw else 0
+            current_start = normalized_line.find(raw, previous_end) if raw else -1
+            between = normalized_line[previous_end:current_start] if current_start >= previous_end else ""
+            # Some legacy OCR uses a tilde to show that the comparison column
+            # reverses from loss to profit.  Preserve that verified convention,
+            # while a literal '-' alone remains a loss marker.
+            if "~" in between or (
+                "당기" in compact
+                and "전기" in compact
+                and raw.strip().startswith("-")
+            ):
+                signed[index] = abs(numbers[index])
+        return signed
+    # For mixed 손익 labels, retain the established OCR inference: a row whose
+    # first cell is visibly a loss often lost the parentheses on later cells.
     normalized_line = normalize_ocr_numbers(line)
-    aliases = ("당기순손실", "당기순손익", "당기순손", "영업손실", "영업손익", "영업손", "순손실")
+    aliases = ("당기순손익", "영업손익", "영업손", "당기순손")
     positions = [normalized_line.find(alias) for alias in aliases if alias in normalized_line]
     if positions:
         normalized_line = normalized_line[min(positions):]
     raw_amounts = AMOUNT_PATTERN.findall(normalized_line)
     signed = [-abs(numbers[0])]
     first_parenthesized = bool(raw_amounts and raw_amounts[0].strip().startswith("("))
-    first_amount_start = normalized_line.find(raw_amounts[0]) if raw_amounts else -1
-    row_prefix_text = normalized_line[:first_amount_start] if first_amount_start >= 0 else ""
-    for alias in aliases:
-        alias_position = row_prefix_text.find(alias)
-        if alias_position >= 0:
-            row_prefix_text = row_prefix_text[alias_position + len(alias):]
-            break
-    row_prefix = normalize(row_prefix_text)
     for index, number in enumerate(numbers[1:], start=1):
         raw = raw_amounts[index] if index < len(raw_amounts) else ""
         previous_raw = raw_amounts[index - 1] if index - 1 < len(raw_amounts) else ""
-        between = ""
         previous_end = normalized_line.find(previous_raw) + len(previous_raw) if previous_raw else 0
         current_start = normalized_line.find(raw, previous_end) if raw else -1
-        if current_start >= previous_end:
-            between = normalized_line[previous_end:current_start]
+        between = normalized_line[previous_end:current_start] if current_start >= previous_end else ""
         explicit_profit = (
-            raw.strip().startswith("-")
-            and (
-                "영업손" in normalized_line
-                or "당기" in row_prefix
-                or "전기" not in normalize(between)
-            )
-            or first_parenthesized and not raw.strip().startswith(("-", "("))
+            first_parenthesized and not raw.strip().startswith(("-", "("))
             or "~" in between
         )
         signed.append(abs(number) if explicit_profit else -abs(number))
@@ -1509,17 +2298,20 @@ def apply_loss_row_signs(line: str, numbers: list[int]) -> list[int]:
 
 def find_period_net_summary(lines: list[str]) -> tuple[str, list[int]] | None:
     period_pattern = (
-        r"{period}\s*[:：]?\s*"
+        r"{period}\s*[^0-9가-힣A-Za-z(+-]{{0,6}}\s*"
         r"(\(?-?(?:\d{{1,3}}(?:,\d{{3}})+|0)\)?)"
         r"(?:\s*원)?"
     )
+    net_labels = ("당기순이익", "당기순손실", "분기순이익", "분기순손실", "결손금")
     for index, line in enumerate(lines):
-        combined = " ".join(lines[index : index + 3])
-        compact = normalize(combined)
-        if "당기" not in compact or "전기" not in compact:
+        if not any(label in normalize(line) for label in net_labels):
             continue
+        # Balance-sheet summaries often print the prior-period amount several
+        # lines *before* the net-income label and the current amount after it.
+        # Search symmetrically around the label instead of only the next rows.
+        combined = " ".join(lines[max(0, index - 8) : min(len(lines), index + 9)])
         current_match = re.search(
-            period_pattern.format(period=r"당\s*기"),
+            period_pattern.format(period=r"[당담탕]\s*[기키]"),
             combined,
         )
         previous_match = re.search(
@@ -1532,7 +2324,7 @@ def find_period_net_summary(lines: list[str]) -> tuple[str, list[int]] | None:
         previous = parse_money(previous_match.group(1))
         if current is None or previous is None:
             continue
-        context = normalize(" ".join(lines[max(0, index - 8) : index + 3]))
+        context = normalize(combined)
         explicit_profit = "당기순이익" in context or "분기순이익" in context
         if not explicit_profit and (
             "당기순손실" in context
@@ -1541,6 +2333,21 @@ def find_period_net_summary(lines: list[str]) -> tuple[str, list[int]] | None:
         ):
             current = -abs(current)
             previous = -abs(previous)
+            tilde_reversal = any(
+                "~" in candidate
+                and abs(previous) in [abs(value) for value in extract_amounts(candidate)]
+                and any(label in normalize(candidate) for label in ("당기순손실", "분기순손실"))
+                for candidate in lines
+            )
+            statement_reversal = any(
+                "전기" not in normalize(window)
+                and -abs(previous) in extract_amounts(window)
+                for statement_index, candidate in enumerate(lines)
+                if any(label in normalize(candidate) for label in ("당기순손실", "분기순손실"))
+                for window in [" ".join(lines[statement_index : statement_index + 3])]
+            )
+            if tilde_reversal or statement_reversal:
+                previous = abs(previous)
         return combined, [current, previous]
     return None
 
@@ -1589,7 +2396,13 @@ def calculated_net_income(lines: list[str]) -> tuple[str, int | float | None, in
 
 
 INCOME_STATEMENT_HEADINGS = ("포괄손익계산서", "손익계산서", "익계산서")
-INCOME_STATEMENT_ENDINGS = ("결손금처리계산서", "이익잉여금처분계산서")
+INCOME_STATEMENT_ENDINGS = (
+    "제조원가명세서",
+    "현금흐름표",
+    "자본변동표",
+    "결손금처리계산서",
+    "이익잉여금처분계산서",
+)
 INCOME_STATEMENT_BODY_TERMS = (
     "매출액",
     "영업수익",
@@ -1631,7 +2444,26 @@ def income_statement_start(lines: list[str]) -> int:
 
     # Preserve the original first-statement behaviour and skip only headings
     # that have no financial rows before the next heading (typically a TOC).
-    return next((index for index in candidates if has_financial_body(index)), candidates[0])
+    valid_start = next((index for index in candidates if has_financial_body(index)), None)
+    if valid_start is not None:
+        return valid_start
+
+    # Some spreadsheet-to-PDF exports print the title at the bottom, after the
+    # actual statement body.  If such a trailing title has at least two distinct
+    # financial row types immediately before it, start at the first body row.
+    trailing = candidates[-1]
+    if trailing >= max(0, len(lines) - 5):
+        body_indexes: list[int] = []
+        seen_terms: set[str] = set()
+        for index in range(max(0, trailing - 180), trailing):
+            compact = normalize(lines[index])
+            matched = [term for term in INCOME_STATEMENT_BODY_TERMS if term in compact]
+            if matched and extract_amounts(lines[index]):
+                body_indexes.append(index)
+                seen_terms.update(matched)
+        if body_indexes and len(seen_terms) >= 2:
+            return min(body_indexes)
+    return candidates[0]
 
 
 def income_statement_scope(lines: list[str]) -> list[str]:
@@ -1649,8 +2481,11 @@ def income_statement_scope(lines: list[str]) -> list[str]:
 
 def zero_tax_pretax_income(lines: list[str]) -> tuple[str, int | float | None, int | float | None] | None:
     aliases = (
+        "법인세비용차감전손익",
+        "법인세비용차감전손실",
         "법인세비용차감전순이익",
         "법인세비용차감전순손실",
+        "법인세차감전순이",
         "법인세차감전순이익",
         "법인세차감전순손실",
         "법인세차감전손익",
@@ -1658,9 +2493,11 @@ def zero_tax_pretax_income(lines: list[str]) -> tuple[str, int | float | None, i
         "법인세차김전순손실",
         "인세차감전손실",
     )
-    match = find_alias_segment(lines, aliases, require_two=False)
+    match = find_cumulative_alias_segment(lines, aliases)
     if not match:
         match = find_vertical_alias_segment(lines, aliases, amount_count=2)
+    if not match:
+        match = find_alias_segment(lines, aliases, require_two=False)
     if not match:
         match = find_context_candidate(lines, aliases)
     if not match:
@@ -1682,7 +2519,10 @@ def zero_tax_pretax_income(lines: list[str]) -> tuple[str, int | float | None, i
         numbers = [-abs(value) for value in numbers]
     current, previous = pick_income_current_previous(numbers, lines)
     if has_single_period_income_layout(lines):
-        previous = None if is_first_fiscal_period_income_layout(lines) else 0
+        previous = None if (
+            is_first_fiscal_period_income_layout(lines)
+            or has_trailing_income_statement_title(lines)
+        ) else 0
     return match, current, previous
 
 
@@ -1690,23 +2530,136 @@ def extract_net_income(lines: list[str], label: str) -> dict | None:
     all_lines = lines
     single_period = has_single_period_income_layout(all_lines)
     first_fiscal_period = is_first_fiscal_period_income_layout(all_lines)
+    missing_comparison_period = (
+        first_fiscal_period or has_trailing_income_statement_title(all_lines)
+    )
     lines = income_statement_scope(lines)
+    aliases = (
+        "당기순손실",
+        "당기순이익",
+        "당기손익",
+        "분기순손실",
+        "분기순이익",
+        "반기순손익",
+    )
+    excluded_net_terms = (
+        "기타포괄",
+        "재분류",
+        "재측정",
+        "공정가치측정",
+        "금융자산평가",
+        "금융부채평가",
+        "평가손익",
+        "이익잉여금",
+        "항목의법인세",
+    )
+
+    def has_excluded_net_context(line: str) -> bool:
+        compact = normalize(line)
+        alias_positions = [compact.find(alias) for alias in aliases if alias in compact]
+        if not alias_positions:
+            return any(term in compact for term in excluded_net_terms)
+        # In a one-line OCR page, an earlier 이익잉여금 heading must not hide a
+        # later explicit 당기순이익 row.  Exclusions only apply from the target
+        # label onward (for example 당기손익-공정가치측정금융자산).
+        target_tail = compact[min(alias_positions) :]
+        return any(term in target_tail for term in excluded_net_terms)
+
+    net_lines = [
+        line
+        for line in lines
+        if not has_excluded_net_context(line)
+    ]
+    all_net_lines = [
+        line
+        for line in all_lines
+        if not has_excluded_net_context(line)
+    ]
     period_summary = find_period_net_summary(all_lines)
-    aliases = ("당기순손실", "당기순이익", "당기손익", "분기순손실", "분기순이익", "반기순손익")
-    match = find_cumulative_alias_segment(lines, aliases)
+
+    def confirmed_period_summary(
+        candidate_current: int | float | None,
+    ) -> tuple[str, int | float | None, int | float | None] | None:
+        if not period_summary or candidate_current is None:
+            return None
+        summary_source, summary_numbers = period_summary
+        summary_current, summary_previous = pick_current_previous(summary_numbers)
+        if summary_current == candidate_current:
+            return summary_source, summary_current, summary_previous
+        return None
+
+    match = find_cumulative_alias_segment(net_lines, aliases)
     if not match:
         match = find_quality_alias_segment(
-        lines,
+        net_lines,
         aliases,
         require_two=True,
         )
     if not match:
         match = find_context_candidate(
-        lines,
+        net_lines,
         ("당기순손실", "당기순이익", "당기손익", "당기순손", "순이익"),
         exclude=("제조원가", "매출원가", "원가"),
         )
     pretax = zero_tax_pretax_income(lines)
+    expected_amount_count = 4 if has_cumulative_income_layout(all_lines) else 2
+    match_amounts = financial_amounts(match, aliases) if match else []
+    has_reference_number = (
+        any(1_000 <= abs(value) < 10_000 for value in match_amounts)
+        and any(abs(value) >= 1_000_000 for value in match_amounts)
+    )
+    match_is_noisy = bool(match) and (
+        len(match) > 500
+        or len(match_amounts) < expected_amount_count
+        or len(match_amounts) > expected_amount_count
+        or has_reference_number
+    )
+    if pretax and period_summary:
+        _pretax_source, pretax_current, pretax_previous = pretax
+        summary_source, summary_numbers = period_summary
+        summary_current, summary_previous = pick_current_previous(summary_numbers)
+        pretax_is_incomplete = (
+            pretax_current in (None, 0)
+            and summary_current not in (None, 0)
+        ) or (
+            pretax_previous is None
+            and summary_previous is not None
+        )
+        summary_confirms_current = (
+            pretax_current not in (None, 0)
+            and summary_current not in (None, 0)
+            and pretax_current == summary_current
+            and (
+                pretax_previous in (None, 0)
+                or summary_previous in (None, 0)
+                or abs(pretax_previous - summary_previous)
+                <= max(1_000, max(abs(pretax_previous), abs(summary_previous)) * 0.05)
+            )
+        )
+        if pretax_is_incomplete or summary_confirms_current:
+            return {
+                "item": label,
+                "current": summary_current if summary_current is not None else "",
+                "previous": summary_previous if summary_previous is not None else "",
+                "status": "당기/전기 요약 금액 사용",
+                "sourceLine": summary_source,
+            }
+    if pretax and (not match or match_is_noisy):
+        source_line, current, previous = pretax
+        return {
+            "item": label,
+            "current": current if current is not None else "",
+            "previous": previous if previous is not None else "",
+            "status": "법인세 0: 세전손익 사용",
+            "sourceLine": source_line,
+        }
+    document_match = find_quality_alias_segment(all_net_lines, aliases, require_two=True)
+    if document_match and match_is_noisy:
+        # A clean row elsewhere in the same report is safer than a synthetic
+        # three-line context containing reference numbers and unrelated
+        # accounts.  This commonly occurs when the primary statement is a
+        # low-quality scan but the deficit schedule repeats net income clearly.
+        match = document_match
     if not match and pretax:
         source_line, current, previous = pretax
         return {
@@ -1720,24 +2673,31 @@ def extract_net_income(lines: list[str], label: str) -> dict | None:
         calculated = calculated_net_income(lines)
         if calculated:
             source_line, current, previous = calculated
+            confirmed_summary = confirmed_period_summary(current)
+            if confirmed_summary:
+                source_line, current, previous = confirmed_summary
+                status = "당기/전기 요약 금액 사용"
+            else:
+                status = "영업손익과 영업외손익으로 계산"
             return {
                 "item": label,
                 "current": current if current is not None else "",
                 "previous": previous if previous is not None else "",
-                "status": "영업손익과 영업외손익으로 계산",
+                "status": status,
                 "sourceLine": source_line,
             }
-        outside_match = find_quality_alias_segment(all_lines, aliases, require_two=True)
-        if outside_match:
-            match = outside_match
+        if document_match:
+            match = document_match
     if not match or len(extract_amounts(match)) < 2:
         start = next((index for index, line in enumerate(lines) if "손익계산서" in normalize(line) or "익계산서" in normalize(line)), -1)
         if start >= 0:
             candidates = []
             for line in lines[start:]:
                 compact = normalize(line)
+                line_amounts = extract_amounts(line)
                 if (
-                    extract_amounts(line)
+                    line_amounts
+                    and any(value == 0 or abs(value) >= 10_000 for value in line_amounts)
                     and "법인세" not in compact
                     and ("당기" in compact or "순" in compact or "손익" in compact or compact.startswith("XS"))
                 ):
@@ -1759,11 +2719,17 @@ def extract_net_income(lines: list[str], label: str) -> dict | None:
         if not calculated:
             return None
         source_line, current, previous = calculated
+        confirmed_summary = confirmed_period_summary(current)
+        if confirmed_summary:
+            source_line, current, previous = confirmed_summary
+            status = "당기/전기 요약 금액 사용"
+        else:
+            status = "영업손익과 영업외손익으로 계산"
         return {
             "item": label,
             "current": current if current is not None else "",
             "previous": previous if previous is not None else "",
-            "status": "영업손익과 영업외손익으로 계산",
+            "status": status,
             "sourceLine": source_line,
         }
 
@@ -1777,18 +2743,24 @@ def extract_net_income(lines: list[str], label: str) -> dict | None:
         numbers = apply_loss_row_signs(match, numbers)
     current, previous = pick_income_current_previous(numbers, lines)
     if single_period:
-        previous = None if first_fiscal_period else 0
+        previous = None if missing_comparison_period else 0
     if pretax:
         pretax_source, pretax_current, pretax_previous = pretax
         suspicious_current = current in (None, 0) or (
             pretax_current not in (None, 0)
             and current not in (None, 0)
-            and max(abs(current), abs(pretax_current)) / min(abs(current), abs(pretax_current)) > 3
+            and (
+                current == -pretax_current
+                or max(abs(current), abs(pretax_current)) / min(abs(current), abs(pretax_current)) > 3
+            )
         )
         suspicious_previous = previous in (None, 0) or (
             pretax_previous not in (None, 0)
             and previous not in (None, 0)
-            and max(abs(previous), abs(pretax_previous)) / min(abs(previous), abs(pretax_previous)) > 3
+            and (
+                previous == -pretax_previous
+                or max(abs(previous), abs(pretax_previous)) / min(abs(previous), abs(pretax_previous)) > 3
+            )
         )
         if suspicious_current:
             match = pretax_source
@@ -1827,7 +2799,7 @@ def extract_net_income(lines: list[str], label: str) -> dict | None:
             ):
                 previous = calculated_previous
     if single_period:
-        previous = None if first_fiscal_period else 0
+        previous = None if missing_comparison_period else 0
     return {
         "item": label,
         "current": current if current is not None else "",
@@ -1871,9 +2843,23 @@ def operating_profit_from_components(lines: list[str]) -> tuple[str, int | float
 
 
 def extract_operating_profit(lines: list[str], label: str) -> dict | None:
-    single_period = has_single_period_income_layout(lines)
+    all_lines = lines
+    scoped_lines = income_statement_scope(all_lines)
+    single_period = has_single_period_income_layout(all_lines)
     aliases = ("영업손실", "영업이익", "영업손익")
-    exact_match = find_cumulative_alias_segment(lines, aliases)
+    # Prefer the audited statement body when it can be identified, but retain
+    # the historical whole-document fallbacks for poorly headed OCR files.
+    exact_match = find_cumulative_alias_segment(scoped_lines, aliases)
+    if not exact_match:
+        exact_match = find_alias_segment(
+            scoped_lines,
+            ("영업손실", "영업이익"),
+            prefer_last=True,
+            require_two=True,
+        )
+    lines = all_lines
+    if not exact_match:
+        exact_match = find_cumulative_alias_segment(lines, aliases)
     if not exact_match:
         exact_match = find_alias_segment(
             lines,
@@ -1980,6 +2966,7 @@ def slice_alias_amounts(line: str, alias: str, count: int = 2) -> str:
         "매출액",
         "매출원가",
         "매출총이익",
+        "판매비와관리비",
         "영업수익",
         "영업이익",
         "영업손실",
@@ -1990,7 +2977,43 @@ def slice_alias_amounts(line: str, alias: str, count: int = 2) -> str:
     if any(other in text_before_amount for other in other_labels):
         return ""
     effective_count = count
-    if count == 2 and len(amounts) >= 4:
+    if len(amounts) >= 2:
+        between_periods = normalize(amount_tail[amounts[0].end() : amounts[1].start()])
+        row_boundary_labels = (
+            "자산총계",
+            "부채총계",
+            "부채와자본총계",
+            "부채및자본총계",
+            "자본총계",
+            "자본금",
+            "기타자본",
+            "자본잉여금",
+            "주식발행초과금",
+            "보통주자본금",
+            "우선주자본금",
+            "자본조정",
+            "유동자산",
+            "비유동자산",
+            "유동부채",
+            "비유동부채",
+            "매출액",
+            "매출원가",
+            "매출총이익",
+            "영업수익",
+            "영업이익",
+            "영업손실",
+            "당기순이익",
+            "당기순손실",
+            "법인세비용차감전",
+        )
+        if any(boundary in between_periods for boundary in row_boundary_labels):
+            effective_count = 1
+        elif re.search(
+            r"(?:비용|급여|소모품비|지급수수료|감가상각|임차료|보험료|세금과공과|통신비|운반비)",
+            between_periods,
+        ):
+            effective_count = 1
+    if effective_count == count and count == 2 and len(amounts) >= 4:
         parsed = [parse_money(match.group(0)) for match in amounts[:4]]
         if (
             all(value is not None for value in parsed)
@@ -2077,15 +3100,32 @@ def find_quality_alias_segment(
 def extract_revenue(lines: list[str], label: str) -> dict | None:
     all_lines = lines
     single_period = has_single_period_income_layout(all_lines)
+    aliases = ("매출액", "배출액", "영업수익")
+    scoped_lines = income_statement_scope(all_lines)
+    scoped_match = ""
+    if income_statement_start(all_lines) >= 0:
+        scoped_match = find_cumulative_alias_segment(scoped_lines, aliases)
+        if not scoped_match:
+            scoped_match = find_quality_alias_segment(scoped_lines, aliases, require_two=True)
+        if not scoped_match:
+            scoped_totals = [
+                line
+                for line in scoped_lines
+                if len(extract_amounts(line)) >= 2
+                and "매출" in normalize(line)
+                and not is_revenue_component_line(line)
+                and not is_revenue_cost_line(line)
+            ]
+            if scoped_totals:
+                scoped_match = min(scoped_totals, key=revenue_candidate_rank)
     income_start = next(
         (
-            index for index, line in enumerate(lines)
+            index for index, line in enumerate(all_lines)
             if any(term in normalize(line) for term in ("손익계산서", "부채와자본총계", "부채및자본총계"))
         ),
         0,
     )
-    lines = lines[income_start:]
-    aliases = ("매출액", "배출액", "영업수익")
+    lines = all_lines[income_start:]
     single_direct_match = find_quality_alias_segment(lines, aliases, require_two=False)
     direct_match = find_cumulative_alias_segment(lines, aliases)
     if not direct_match:
@@ -2108,7 +3148,7 @@ def extract_revenue(lines: list[str], label: str) -> dict | None:
         and any(hint in normalize(line) for hint in ("매출액", "출액", "영업수익", "수수료수익", "제품매출"))
         and not is_revenue_cost_line(line)
     ]
-    match = direct_match or (min(revenue_candidates, key=revenue_candidate_rank) if revenue_candidates else "")
+    match = scoped_match or direct_match or (min(revenue_candidates, key=revenue_candidate_rank) if revenue_candidates else "")
     if not match or revenue_candidate_rank(match)[0] >= 2:
         generic_totals = [
             line for line in lines
@@ -2398,6 +3438,17 @@ def financial_amounts(line: str, aliases: tuple[str, ...]) -> list[int | float]:
     if label_matches:
         normalized_line = normalized_line[min(match.start() for match in label_matches):]
     numbers = extract_amounts(normalized_line)
+    if len(numbers) == 1:
+        short_previous = re.search(
+            r"(?:\d{1,3}(?:,\d{3})+|\d{4,})[ \t]+(\(?-?\d{1,3}\)?)\s*$",
+            normalized_line,
+        )
+        if short_previous:
+            raw = short_previous.group(1)
+            short_value = int(raw.strip("()-"))
+            if raw.startswith(("-", "(")):
+                short_value = -short_value
+            numbers.append(short_value)
     if len(numbers) >= 3 and abs(numbers[0]) < max(1, abs(numbers[1])) * 0.01:
         numbers = numbers[1:]
     if (

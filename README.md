@@ -25,11 +25,11 @@
 ocrmypdf --force-ocr --deskew --rotate-pages --pdf-renderer sandwich --sidecar OCR텍스트.txt -l kor+eng
 ```
 
-기본 **빠른 모드**는 아래 설정으로 OCR을 정확히 한 번만 실행합니다.
+속도를 우선할 때 **빠른 모드**는 아래 설정으로 OCR을 정확히 한 번만 실행합니다.
 
 - `kor+eng`, PSM 6, 300 DPI
 
-문제가 있는 스캔 PDF에 사용자가 **정밀 모드**를 선택했을 때만 아래 5가지 설정을 비교합니다.
+숫자 정확도를 우선하도록 기본 선택된 **정밀 모드**는 아래 5가지 설정을 비교합니다.
 
 - `kor+eng`, PSM 6, 300 DPI
 - `kor+eng`, PSM 4, 400 DPI
